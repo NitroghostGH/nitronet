@@ -2,6 +2,13 @@
 name = "nitronet"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Terminal UI for open ports, per-program traffic, LAN devices and per-program packet capture, using hand-assembled eBPF"
+license = "MIT OR GPL-2.0-only"
+repository = "https://github.com/NitroghostGH/nitronet"
+readme = "README.md"
+keywords = ["network", "ebpf", "tui", "monitoring", "packet-capture"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 libc = "0.2.191"

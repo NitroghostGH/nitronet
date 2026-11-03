@@ -90,3 +90,7 @@ Most traffic is encrypted (TLS, QUIC), so you see who a program talks to, when, 
 ## Dependencies
 
 The only direct dependencies are `ratatui` (default features off, only the `crossterm` backend) and `libc`. crossterm already pulls in `libc`, so listing it directly adds nothing. Netlink, eBPF loading, the ring buffer reader, packet decoding, /proc parsing, argument parsing and formatting are written by hand against std and libc. About 63 crates are compiled on Linux, all of them from ratatui/crossterm. `Cargo.lock` has more entries because it also pins Windows-only crates that never get built here. Build with `--locked` to keep the lockfile fixed.
+
+## License
+
+nitronet is available under either the [MIT license](LICENSE-MIT) or the [GNU GPL, version 2](LICENSE-GPL), at your option. That matches the "Dual MIT/GPL" license the eBPF programs declare to the kernel.
