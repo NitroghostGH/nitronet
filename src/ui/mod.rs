@@ -502,14 +502,17 @@ impl App {
         socks: &[usize],
         devs: &[DevKey],
         pkts: &[usize],
-        flows: &[Flow],
+        flows: Option<&[Flow]>,
     ) {
-        let row = self
-            .flow_sel
-            .as_ref()
-            .and_then(|k| flows.iter().position(|f| f.key == *k));
-        let row = row.unwrap_or_else(|| self.flow_state.selected().unwrap_or(0));
-        self.select_flow(flows, row);
+        // Conversations are listed only while shown (see `shown_flows`).
+        if let Some(flows) = flows {
+            let row = self
+                .flow_sel
+                .as_ref()
+                .and_then(|k| flows.iter().position(|f| f.key == *k));
+            let row = row.unwrap_or_else(|| self.flow_state.selected().unwrap_or(0));
+            self.select_flow(flows, row);
+        }
 
         let row = match self.pkt_sel {
             None => self.newest_row(pkts),
@@ -599,6 +602,12 @@ impl App {
         self.flow_sel = Some(flows[row].key.clone());
     }
 
+    /// The conversations, when they are on screen. Grouping every packet
+    /// into conversations is the costliest list, so it isn't done otherwise.
+    pub fn shown_flows(&self) -> Option<Vec<Flow>> {
+        (self.tab == Tab::Packets && self.pkt_flows).then(|| self.flows())
+    }
+
     /// Enter on a conversation: list just its packets, from its first one.
     fn open_flow(&mut self) {
         let Some(key) = self.flow_sel.clone() else {
@@ -633,8 +642,9 @@ impl App {
         let socks = self.sock_rows();
         let devs = self.dev_rows();
         let pkts = self.pkt_rows();
-        let flows = self.flows();
-        self.sync_selection(&views, &socks, &devs, &pkts, &flows);
+        let flows = self.shown_flows();
+        self.sync_selection(&views, &socks, &devs, &pkts, flows.as_deref());
+        let flows = flows.unwrap_or_default();
         match self.tab {
             Tab::Procs => {
                 let row = to(self.proc_state.selected().unwrap_or(0), views.len());

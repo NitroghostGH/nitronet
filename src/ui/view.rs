@@ -48,8 +48,9 @@ pub fn draw(app: &mut App, f: &mut Frame) {
     let socks = app.sock_rows();
     let devs = app.dev_rows();
     let pkts = app.pkt_rows();
-    let flows = app.flows();
-    app.sync_selection(&views, &socks, &devs, &pkts, &flows);
+    let flows = app.shown_flows();
+    app.sync_selection(&views, &socks, &devs, &pkts, flows.as_deref());
+    let flows = flows.unwrap_or_default();
     let tabs = tab_title(
         app,
         body,
@@ -394,6 +395,30 @@ fn sort_arrow(desc: bool) -> &'static str {
 
 /// Draws a responsive table into a bordered panel: columns that don't fit are
 /// dropped by priority, and there's a scrollbar and an empty-state message.
+/// The rows a table on `area` can show this frame. ratatui keeps the scroll
+/// offset, or moves it just enough to show the selection, so a screenful
+/// either side of both covers it. Callers build cells only for these rows
+/// and pass empty ones for the rest, which keeps a frame cheap with
+/// thousands of packets.
+pub(super) fn table_window(app: &App, len: usize, area: Rect) -> std::ops::Range<usize> {
+    let state = match app.tab {
+        Tab::Procs => &app.proc_state,
+        Tab::Sockets => &app.sock_state,
+        Tab::Devices => &app.dev_state,
+        Tab::Packets if app.pkt_flows => &app.flow_state,
+        Tab::Packets => &app.pkt_state,
+    };
+    let h = area.height as usize;
+    let last = len.saturating_sub(1);
+    let sel = state.selected().unwrap_or(0).min(last);
+    let off = state.offset().min(last);
+    let lo = off.min(sel).saturating_sub(h);
+    let hi = (off.max(sel) + h + 1).min(len);
+    lo..hi
+}
+
+/// Draws a table. `rows` has one entry per row; rows outside `table_window`
+/// may be empty.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_table(
     app: &mut App,
@@ -426,6 +451,9 @@ pub(super) fn draw_table(
         Cell::from(if c.right { line.right_aligned() } else { line })
     }));
     let rows = rows.into_iter().map(|cells| {
+        if cells.is_empty() {
+            return Row::default();
+        }
         let mut cells: Vec<Option<Cell>> = cells.into_iter().map(Some).collect();
         Row::new(
             shown
@@ -524,9 +552,14 @@ fn draw_procs(app: &mut App, f: &mut Frame, area: Rect, views: &[ProcView], tabs
         .iter()
         .map(|v| v.row.rate_in + v.row.rate_out)
         .fold(0.0, f64::max);
+    let win = table_window(app, views.len(), area);
     let rows = views
         .iter()
-        .map(|v| {
+        .enumerate()
+        .map(|(i, v)| {
+            if !win.contains(&i) {
+                return Vec::new();
+            }
             let captured = app.is_captured(&v.row);
             proc_cells(t, v, max_rate, captured)
         })
@@ -703,9 +736,14 @@ fn draw_sockets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: L
         .iter()
         .map(|s| s.rate_in.unwrap_or(0.0) + s.rate_out.unwrap_or(0.0))
         .fold(0.0, f64::max);
+    let win = table_window(app, socks.len(), area);
     let rows = socks
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
+            if !win.contains(&i) {
+                return Vec::new();
+            }
             let name = names
                 .iter()
                 .find(|(o, _)| *o == s.owner)
@@ -1261,9 +1299,16 @@ fn draw_devices(app: &mut App, f: &mut Frame, area: Rect, devs: &[DevKey], tabs:
         .as_ref()
         .map(|i| i.ipv6.as_slice())
         .unwrap_or(&[]);
+    let win = table_window(app, devs.len(), area);
     let rows = devs
         .iter()
-        .map(|k| dev_cells(t, &app.lan_state.devices[k], ours))
+        .enumerate()
+        .map(|(i, k)| {
+            if !win.contains(&i) {
+                return Vec::new();
+            }
+            dev_cells(t, &app.lan_state.devices[k], ours)
+        })
         .collect();
     let (sorted_col, desc) = match app.dev_sort {
         DevSort::Ip => (1, false),

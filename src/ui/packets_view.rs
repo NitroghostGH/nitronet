@@ -12,7 +12,7 @@ use ratatui::widgets::{Cell, Paragraph};
 
 use super::fmt::{elide_end, elide_middle, human};
 use super::theme::{Theme, theme};
-use super::view::{addr_line, draw_table, empty_message, filter_line, panel};
+use super::view::{addr_line, draw_table, empty_message, filter_line, panel, table_window};
 use super::widgets::{Col, col};
 use super::{App, ContentFilter, DirFilter, Flow, FlowSort};
 use crate::packet::{self, Content, Endpoint, L4, Packet};
@@ -164,7 +164,18 @@ const PKT_COLS: [Col; 8] = [
 
 fn draw_packets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: Line<'static>) {
     let t = theme();
-    let rows = idx.iter().map(|&i| pkt_cells(t, &app.packets[i])).collect();
+    let win = table_window(app, idx.len(), area);
+    let rows = idx
+        .iter()
+        .enumerate()
+        .map(|(row, &i)| {
+            if win.contains(&row) {
+                pkt_cells(t, &app.packets[i])
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     let mut block = panel()
         .title(tabs)
         .title_top(status_line(app, idx.len(), "packets"))
@@ -611,7 +622,18 @@ const FLOW_COLS: [Col; 9] = [
 
 fn draw_flows(app: &mut App, f: &mut Frame, area: Rect, flows: &[Flow], tabs: Line<'static>) {
     let t = theme();
-    let rows = flows.iter().map(|fl| flow_cells(t, fl)).collect();
+    let win = table_window(app, flows.len(), area);
+    let rows = flows
+        .iter()
+        .enumerate()
+        .map(|(i, fl)| {
+            if win.contains(&i) {
+                flow_cells(t, fl)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     let (sorted, desc) = match app.flow_sort {
         FlowSort::Recent => (0, true),
         FlowSort::Program => (1, false),
