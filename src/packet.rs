@@ -174,6 +174,9 @@ impl Decoded {
     }
 }
 
+/// Captured packets kept for the UI.
+pub const MAX_PACKETS: usize = 5000;
+
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 const ICMP: u8 = 1;

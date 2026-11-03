@@ -36,7 +36,6 @@ pub(crate) use packets::{ContentFilter, DirFilter, Flow, FlowSort};
 /// two samples per cell.
 const HISTORY: usize = 600;
 /// Captured packets kept for the Packets tab; older ones scroll away.
-const MAX_PACKETS: usize = 5000;
 /// How long a status message stays in the footer.
 const FLASH: Duration = Duration::from_secs(4);
 
@@ -71,6 +70,10 @@ pub fn run(
             if let Err(e) = sampler.set_capture(&names) {
                 app.capturing.clear();
                 app.flash(e);
+            }
+            if app.capturing.is_empty() {
+                // The last packets read before the stop.
+                app.add_packets(sampler.take_packets());
             }
         }
         // While paused, packets wait in the sampler and appear on resume.
@@ -112,9 +115,12 @@ pub fn run(
         }
         if Instant::now() >= next {
             // Keep sampling while paused so totals stay accurate; just don't show it.
-            let snap = sampler.sample()?;
-            if !app.paused {
-                app.set_snapshot(snap);
+            // A failed sample (e.g. netlink busy) is shown and retried, rather
+            // than closing the program.
+            match sampler.sample() {
+                Ok(snap) if !app.paused => app.set_snapshot(snap),
+                Ok(_) => {}
+                Err(e) => app.flash(format!("couldn't read sockets: {e}")),
             }
             next = Instant::now() + interval;
         }
@@ -425,8 +431,8 @@ impl App {
 
     pub fn add_packets(&mut self, packets: Vec<Packet>) {
         self.packets.extend(packets);
-        if self.packets.len() > MAX_PACKETS {
-            let extra = self.packets.len() - MAX_PACKETS;
+        if self.packets.len() > crate::packet::MAX_PACKETS {
+            let extra = self.packets.len() - crate::packet::MAX_PACKETS;
             self.packets.drain(..extra);
         }
     }

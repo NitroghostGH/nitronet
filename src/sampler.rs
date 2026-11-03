@@ -17,7 +17,12 @@ use crate::packet::{self, Classifier, Content, Packet};
 use crate::procfs::{self, ProcMap};
 
 /// Captured packets held for the UI (for example while it is paused).
-const PENDING: usize = 20_000;
+/// Packets kept while waiting for the UI (e.g. while paused). It is the
+/// number the UI keeps, so nothing waits only to be thrown away there.
+const PENDING: usize = crate::packet::MAX_PACKETS;
+/// Programs that exited are remembered for their totals, up to this many.
+/// Past that, the ones that moved the least are forgotten.
+const MAX_DEAD: usize = 1000;
 
 /// Who a socket belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -275,6 +280,11 @@ impl Sampler {
                 } else {
                     Owner::Uid(e.uid)
                 });
+                // Not every socket is closed: some are outside the dump (in a
+                // container's network namespace, or ping and raw sockets). The
+                // entry was just deleted, so if the socket sends again its new
+                // entry has no creator. Remember the owner for it.
+                next_seen.insert(cookie, owner);
                 let row = self.live_row(&mut live, owner, &pm, e.uid, Some(&e));
                 row.rate_in += per_sec(d_in);
                 row.rate_out += per_sec(d_out);
@@ -286,6 +296,7 @@ impl Sampler {
         // churn of short-lived pids from growing the map forever.
         self.acc
             .retain(|k, a| live.contains_key(k) || a.total_in > 0 || a.total_out > 0);
+        forget_dead(&mut self.acc, &live);
 
         let mut procs: Vec<ProcRow> = Vec::with_capacity(self.acc.len());
         for (owner, acc) in &self.acc {
@@ -537,15 +548,39 @@ impl Sampler {
 /// Adds bytes to an owner's running totals. This is a free function so it can
 /// run while other fields of the sampler are borrowed.
 fn account(accs: &mut HashMap<Owner, Acc>, owner: Owner, row: &ProcRow, d_in: u64, d_out: u64) {
-    let acc = accs.entry(owner).or_insert_with(|| Acc {
+    let fresh = || Acc {
         name: row.name.clone(),
         unit: row.unit.clone(),
         user: row.user.clone(),
         total_in: 0,
         total_out: 0,
-    });
+    };
+    let acc = accs.entry(owner).or_insert_with(fresh);
+    // The pid now runs something else: it was reused by a new process (or
+    // the process exec'd another program). Start over, so the new program
+    // isn't shown, or captured, under the old one's name and totals.
+    if acc.name != row.name || acc.user != row.user {
+        *acc = fresh();
+    }
+    acc.unit.clone_from(&row.unit);
     acc.total_in += d_in;
     acc.total_out += d_out;
+}
+
+/// Keeps at most MAX_DEAD exited owners, dropping the ones that moved least.
+fn forget_dead(accs: &mut HashMap<Owner, Acc>, live: &HashMap<Owner, ProcRow>) {
+    let mut dead: Vec<(u64, Owner)> = accs
+        .iter()
+        .filter(|(o, _)| !live.contains_key(o))
+        .map(|(o, a)| (a.total_in.saturating_add(a.total_out), *o))
+        .collect();
+    if dead.len() <= MAX_DEAD {
+        return;
+    }
+    dead.sort_unstable();
+    for (_, o) in &dead[..dead.len() - MAX_DEAD] {
+        accs.remove(o);
+    }
 }
 
 impl Sampler {
@@ -605,7 +640,54 @@ fn delta(cur: (u64, u64), prev: Option<(u64, u64)>, count_unseen: bool) -> (u64,
 
 #[cfg(test)]
 mod tests {
-    use super::delta;
+    use super::*;
+
+    fn row(owner: Owner, name: &str) -> ProcRow {
+        ProcRow {
+            owner,
+            name: name.into(),
+            unit: None,
+            user: "nitro".into(),
+            alive: true,
+            rate_in: 0.0,
+            rate_out: 0.0,
+            total_in: 0,
+            total_out: 0,
+            sockets: 0,
+            listening: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_reused_pid_starts_over() {
+        let mut accs = HashMap::new();
+        let pid = Owner::Pid(4242);
+        account(&mut accs, pid, &row(pid, "firefox"), 100, 50);
+        account(&mut accs, pid, &row(pid, "firefox"), 10, 5);
+        assert_eq!((accs[&pid].total_in, accs[&pid].total_out), (110, 55));
+        // The pid now belongs to another program.
+        account(&mut accs, pid, &row(pid, "evil"), 1, 2);
+        let a = &accs[&pid];
+        assert_eq!((a.name.as_str(), a.total_in, a.total_out), ("evil", 1, 2));
+    }
+
+    #[test]
+    fn exited_programs_are_capped() {
+        let mut accs = HashMap::new();
+        let mut live = HashMap::new();
+        for pid in 0..(MAX_DEAD as u32 + 50) {
+            let o = Owner::Pid(pid);
+            account(&mut accs, o, &row(o, "short"), u64::from(pid) + 1, 0);
+        }
+        let alive = Owner::Pid(0);
+        live.insert(alive, row(alive, "short"));
+        forget_dead(&mut accs, &live);
+        assert_eq!(accs.len(), MAX_DEAD + 1);
+        // The live one stays even though it moved least; the smallest dead go.
+        assert!(accs.contains_key(&alive));
+        assert!(!accs.contains_key(&Owner::Pid(1)));
+        assert!(accs.contains_key(&Owner::Pid(MAX_DEAD as u32 + 49)));
+    }
 
     #[test]
     fn deltas() {
