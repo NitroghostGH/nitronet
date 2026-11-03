@@ -1,6 +1,7 @@
 //! ratatui front end: app state, the event loop, and input handling.
 //! Drawing is in `view.rs`.
 
+mod diagram;
 mod fmt;
 mod theme;
 mod view;
@@ -249,6 +250,9 @@ pub(crate) struct App {
     pub paused: bool,
     pub show_detail: bool,
     pub show_help: bool,
+    /// The "how it works" overlay, and how far it is scrolled.
+    pub show_diagram: bool,
+    pub diagram_scroll: u16,
     pub filter: String,
     pub editing_filter: bool,
     pub proc_state: TableState,
@@ -280,6 +284,8 @@ impl App {
             paused: false,
             show_detail: true,
             show_help: false,
+            show_diagram: false,
+            diagram_scroll: 0,
             filter: String::new(),
             editing_filter: false,
             proc_state: TableState::default().with_selected(0),
@@ -442,6 +448,21 @@ impl App {
             }
             return false;
         }
+        if self.show_diagram {
+            // Arrows scroll; any other key closes; q still quits.
+            let s = &mut self.diagram_scroll;
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => *s = s.saturating_add(1),
+                KeyCode::Up | KeyCode::Char('k') => *s = s.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => *s = s.saturating_add(10),
+                KeyCode::PageUp => *s = s.saturating_sub(10),
+                KeyCode::Home => *s = 0,
+                KeyCode::End => *s = u16::MAX,
+                KeyCode::Char('q') => return true,
+                _ => self.show_diagram = false,
+            }
+            return false;
+        }
         if self.show_help {
             // Any key closes help; q still quits.
             self.show_help = false;
@@ -457,6 +478,10 @@ impl App {
                 }
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
+            KeyCode::Char('H') => {
+                self.show_diagram = true;
+                self.diagram_scroll = 0;
+            }
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Tab | KeyCode::Right => self.set_tab(match self.tab {
                 Tab::Procs => Tab::Sockets,
@@ -529,6 +554,19 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
+        if self.show_diagram {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    self.diagram_scroll = self.diagram_scroll.saturating_add(3)
+                }
+                MouseEventKind::ScrollUp => {
+                    self.diagram_scroll = self.diagram_scroll.saturating_sub(3)
+                }
+                MouseEventKind::Down(_) => self.show_diagram = false,
+                _ => {}
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollDown => self.move_by(3),
             MouseEventKind::ScrollUp => self.move_by(-3),

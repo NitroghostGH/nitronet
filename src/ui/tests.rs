@@ -685,6 +685,13 @@ fn snapshots() {
             &[KeyCode::Char('3'), KeyCode::Down, KeyCode::Down],
         ),
         ("devices-nas", 180, 46, &[KeyCode::Char('3'), KeyCode::Down]),
+        ("diagram", 180, 46, &[KeyCode::Char('H')]),
+        (
+            "diagram-small",
+            80,
+            24,
+            &[KeyCode::Char('H'), KeyCode::PageDown],
+        ),
     ];
     for (name, w, h, keys) in shots {
         let mut a = app();
@@ -916,4 +923,60 @@ fn ipv6_tail_fits_by_group() {
         "…:aa10:7b3c"
     );
     assert_eq!(super::view::v6_tail("fe80::1", 15), "fe80::1");
+}
+
+#[test]
+fn diagram_opens_scrolls_and_closes() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('H'));
+    assert!(a.show_diagram);
+    let text = buffer_text(&render(&mut a, 180, 60));
+    for want in [
+        "how nitronet works",
+        "TRAFFIC",
+        "DEVICES",
+        "NETLINK_SOCK_DIAG",
+        "IPv4 192.168.0.0/24",
+        "IPv6 2001:db8:322e::/64",
+        "ff02::1",
+        "ARP who-has",
+        "11 devices online, 4 with IPv6",
+    ] {
+        assert!(text.contains(want), "missing {want:?}");
+    }
+    // Small terminals scroll instead of cutting it off.
+    render(&mut a, 80, 24);
+    key(&mut a, KeyCode::End);
+    let text = buffer_text(&render(&mut a, 80, 24));
+    assert!(text.contains("writes no files"));
+    assert!(a.diagram_scroll > 0);
+    // Every size renders without panicking.
+    for (w, h) in [(20, 5), (40, 12), (60, 20), (120, 30), (250, 80)] {
+        render(&mut a, w, h);
+    }
+    // Any other key closes it without acting on it.
+    let tab = a.tab;
+    key(&mut a, KeyCode::Char('2'));
+    assert!(!a.show_diagram);
+    assert_eq!(a.tab, tab);
+}
+
+#[test]
+fn diagram_boxes_line_up() {
+    // Every row of a box pair is as wide as its top border.
+    let a = app();
+    for w in [60, 88] {
+        let lines = super::diagram::lines(&a, w);
+        let mut width = None;
+        for l in &lines {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            let starts_box = text.starts_with('╭');
+            if starts_box {
+                width = Some(l.width());
+            }
+            if text.starts_with('│') || text.starts_with('╰') {
+                assert_eq!(Some(l.width()), width, "misaligned at width {w}: {text:?}");
+            }
+        }
+    }
 }

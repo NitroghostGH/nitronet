@@ -11,7 +11,7 @@ sudo ./target/release/nitronet             # full mode: eBPF counting of TCP+UDP
 ./target/release/nitronet --scan           # list the devices on your local network and exit
 ```
 
-Keys: `?` help · `q` quit · `/` filter · `tab` `←` `→` `1`-`3` switch view · `↑↓ PgUp PgDn Home End` move · `s` cycle sort · `r` reverse · `g` group processes by program · `l` listening sockets only · `p` check a device's ports · `R` rescan devices · `enter` toggle detail pane · `space` pause. The mouse works too: click tabs and rows, scroll with the wheel. Hold shift to select text while mouse capture is on.
+Keys: `?` help · `H` how it works (a diagram of what nitronet reads and sends, filled in with what it is doing on your machine) · `q` quit · `/` filter · `tab` `←` `→` `1`-`3` switch view · `↑↓ PgUp PgDn Home End` move · `s` cycle sort · `r` reverse · `g` group processes by program · `l` listening sockets only · `p` check a device's ports · `R` rescan devices · `enter` toggle detail pane · `space` pause. The mouse works too: click tabs and rows, scroll with the wheel. Hold shift to select text while mouse capture is on.
 
 The UI uses truecolor and never paints the terminal background, so transparent terminals stay transparent. Set `NO_COLOR=1` for a monochrome version. Narrow terminals drop the less important columns, and below 70×22 the traffic graph collapses into a one-line header.
 

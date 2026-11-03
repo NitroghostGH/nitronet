@@ -86,6 +86,9 @@ pub fn draw(app: &mut App, f: &mut Frame) {
     if app.show_help {
         draw_help(f, area);
     }
+    if app.show_diagram {
+        super::diagram::draw(app, f, area);
+    }
 }
 
 // ------------------------------------------------------------------ header
@@ -1000,6 +1003,7 @@ fn draw_footer(app: &App, f: &mut Frame, area: Rect) {
         }
     }
     hints.push(("space", if app.paused { "resume" } else { "pause" }));
+    hints.push(("H", "how it works"));
 
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
@@ -1053,6 +1057,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             &[
                 ("space", "pause the display"),
                 ("?", "this help"),
+                ("H", "how nitronet works (diagram)"),
                 ("q  esc", "quit"),
             ],
         ),
