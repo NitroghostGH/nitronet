@@ -238,6 +238,7 @@ pub(crate) fn fixture(k: usize) -> Snapshot {
             name: p.name.into(),
             unit: p.unit.map(Into::into),
             user: p.user.into(),
+            uid: Some(1000),
             alive: true,
             rate_in: if p.rate.0 > 0.0 { ri } else { 0.0 },
             rate_out: if p.rate.1 > 0.0 { ro } else { 0.0 },
@@ -253,6 +254,7 @@ pub(crate) fn fixture(k: usize) -> Snapshot {
         name: "curl".into(),
         unit: None,
         user: "nitro".into(),
+        uid: Some(1000),
         alive: false,
         rate_in: 0.0,
         rate_out: 0.0,
@@ -284,6 +286,7 @@ pub(crate) fn fixture(k: usize) -> Snapshot {
         name: "(kernel)".into(),
         unit: None,
         user: "-".into(),
+        uid: None,
         alive: true,
         rate_in: 0.0,
         rate_out: 0.0,
@@ -477,7 +480,7 @@ fn app() -> App {
         app.set_snapshot(fixture(k));
     }
     app.lan_state = lan_fixture();
-    app.capturing = ["curl".to_string(), "firefox".to_string()].into();
+    app.capturing = [("curl".to_string(), 1000), ("firefox".to_string(), 1000)].into();
     app.add_packets(packet_fixture(0));
     app
 }
@@ -1217,7 +1220,7 @@ fn packets_tab_lists_follows_and_filters() {
 
     // c stops capturing the selected packet's program; x clears the list.
     key(&mut a, KeyCode::Char('c'));
-    assert!(!a.capturing.contains("curl") && a.capture_dirty);
+    assert!(!a.capturing.contains_key("curl") && a.capture_dirty);
     let text = buffer_text(&render(&mut a, 180, 46));
     assert!(text.contains("stopped capturing curl"));
     key(&mut a, KeyCode::Char('x'));
@@ -1235,7 +1238,7 @@ fn c_toggles_capture_on_processes() {
     assert!(!text.contains("● firefox"));
     let name = selected_name(&a);
     key(&mut a, KeyCode::Char('c'));
-    assert!(a.capturing.contains(&name) && a.capture_dirty);
+    assert!(a.capturing.contains_key(&name) && a.capture_dirty);
     let text = buffer_text(&render(&mut a, 180, 46));
     assert!(text.contains(&format!("● {name}")), "{text}");
     assert!(text.contains(&format!("capturing {name} · press 4")));

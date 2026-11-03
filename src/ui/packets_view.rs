@@ -94,7 +94,7 @@ fn status_line(app: &App, shown: usize, what: &str) -> Line<'static> {
     } else {
         s.push(Span::styled(" ● ", t.fg(t.warn)));
         s.push(Span::styled("capturing ", t.muted()));
-        let names: Vec<&str> = app.capturing.iter().map(String::as_str).collect();
+        let names: Vec<&str> = app.capturing.keys().map(String::as_str).collect();
         s.push(Span::styled(elide_end(&names.join(", "), 32), t.fg(t.text)));
     }
     let chip = |s: &mut Vec<Span<'static>>, text: &str| {
@@ -144,7 +144,7 @@ fn empty_text(app: &App, what: &str) -> String {
     } else if app.capturing.is_empty() {
         "nothing captured · select a program in Processes (1) and press c".to_string()
     } else {
-        let names: Vec<&str> = app.capturing.iter().map(String::as_str).collect();
+        let names: Vec<&str> = app.capturing.keys().map(String::as_str).collect();
         format!("waiting for packets from {}…", names.join(", "))
     }
 }

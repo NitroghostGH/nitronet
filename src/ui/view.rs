@@ -527,8 +527,7 @@ fn draw_procs(app: &mut App, f: &mut Frame, area: Rect, views: &[ProcView], tabs
     let rows = views
         .iter()
         .map(|v| {
-            let captured =
-                matches!(v.row.owner, Owner::Pid(_)) && app.capturing.contains(&v.row.name);
+            let captured = app.is_captured(&v.row);
             proc_cells(t, v, max_rate, captured)
         })
         .collect();
@@ -895,7 +894,7 @@ fn draw_detail(app: &App, f: &mut Frame, area: Rect, v: &ProcView) {
     }
     if matches!(r.owner, Owner::Pid(_)) {
         lines.push(Line::default());
-        lines.push(if app.capturing.contains(&r.name) {
+        lines.push(if app.is_captured(r) {
             let n = app.packets.iter().filter(|p| p.program == r.name).count();
             kv(
                 "capture",

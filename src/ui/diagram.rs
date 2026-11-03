@@ -361,7 +361,7 @@ fn capture_status(app: &App) -> Vec<Span<'static>> {
             t.muted(),
         )];
     }
-    let names: Vec<&str> = app.capturing.iter().map(String::as_str).collect();
+    let names: Vec<&str> = app.capturing.keys().map(String::as_str).collect();
     let mut v = vec![
         Span::styled(format!("capturing {}", names.join(", ")), t.fg(t.good)),
         Span::styled(

@@ -12,7 +12,7 @@ mod widgets;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -66,8 +66,9 @@ pub fn run(
         }
         if app.capture_dirty {
             app.capture_dirty = false;
-            let names: HashSet<String> = app.capturing.iter().cloned().collect();
-            if let Err(e) = sampler.set_capture(&names) {
+            let targets: HashMap<String, u32> =
+                app.capturing.iter().map(|(n, &u)| (n.clone(), u)).collect();
+            if let Err(e) = sampler.set_capture(&targets) {
                 app.capturing.clear();
                 app.flash(e);
             }
@@ -340,7 +341,8 @@ pub(crate) struct App {
     pub flow_sel: Option<FlowKey>,
     pub flow_sort: FlowSort,
     /// Programs (by name) whose packets are captured.
-    pub capturing: BTreeSet<String>,
+    /// Captured program names, each with the uid it is captured for.
+    pub capturing: BTreeMap<String, u32>,
     /// Set when `capturing` changed and the sampler needs telling.
     pub capture_dirty: bool,
     pub capture_dropped: u64,
@@ -391,7 +393,7 @@ impl App {
             flow_state: TableState::default(),
             flow_sel: None,
             flow_sort: FlowSort::Recent,
-            capturing: BTreeSet::new(),
+            capturing: BTreeMap::new(),
             capture_dirty: false,
             capture_dropped: 0,
             flash: None,
@@ -437,13 +439,26 @@ impl App {
         }
     }
 
-    /// Starts or stops capturing a program's packets.
-    fn toggle_capture(&mut self, name: String) {
-        if self.capturing.remove(&name) {
+    /// Whether a process row's packets are being captured: its name is, for
+    /// its user. Another user's process with the same name isn't.
+    pub fn is_captured(&self, row: &ProcRow) -> bool {
+        matches!(row.owner, Owner::Pid(_))
+            && self
+                .capturing
+                .get(&row.name)
+                .is_some_and(|u| row.uid.is_none_or(|r| r == *u))
+    }
+
+    /// Starts or stops capturing a program's packets. `uid` is the user
+    /// whose processes of that name are captured; None only stops.
+    fn toggle_capture(&mut self, name: String, uid: Option<u32>) {
+        if self.capturing.remove(&name).is_some() {
             self.flash(format!("stopped capturing {name}"));
-        } else {
+        } else if let Some(uid) = uid {
             self.flash(format!("capturing {name} · press 4 to watch its packets"));
-            self.capturing.insert(name);
+            self.capturing.insert(name, uid);
+        } else {
+            return;
         }
         self.capture_dirty = true;
     }
@@ -786,7 +801,19 @@ impl App {
                 let views = self.proc_views();
                 let row = self.proc_state.selected();
                 match row.and_then(|r| views.get(r)) {
-                    Some(v) if matches!(v.row.owner, Owner::Pid(_)) => Some(v.row.name.clone()),
+                    Some(v) if self.capturing.contains_key(&v.row.name) => {
+                        Some((v.row.name.clone(), None))
+                    }
+                    Some(v) if matches!(v.row.owner, Owner::Pid(_)) && v.row.uid.is_none() => {
+                        self.flash(format!(
+                            "{} runs as several users: press g to ungroup and pick one",
+                            v.row.name
+                        ));
+                        None
+                    }
+                    Some(v) if matches!(v.row.owner, Owner::Pid(_)) => {
+                        Some((v.row.name.clone(), v.row.uid))
+                    }
                     Some(_) => {
                         self.flash("only programs can be captured, not kernel or unresolved rows");
                         None
@@ -804,7 +831,7 @@ impl App {
                         .map(|&i| self.packets[i].program.clone())
                 };
                 match program {
-                    Some(name) if self.capturing.contains(&name) => Some(name),
+                    Some(name) if self.capturing.contains_key(&name) => Some((name, None)),
                     _ if self.capturing.is_empty() => {
                         self.flash("select a program in Processes (1) and press c to capture it");
                         None
@@ -817,8 +844,8 @@ impl App {
                 None
             }
         };
-        if let Some(n) = name {
-            self.toggle_capture(n);
+        if let Some((n, uid)) = name {
+            self.toggle_capture(n, uid);
         }
     }
 
@@ -1067,6 +1094,9 @@ impl App {
                         }
                         if r.user != p.user {
                             r.user = "*".into();
+                        }
+                        if r.uid != p.uid {
+                            r.uid = None;
                         }
                         r.owner = r.owner.min(p.owner);
                     }

@@ -381,6 +381,11 @@ impl Asm {
     fn jeq(&mut self, reg: u8, imm: i32, target: &'static str) {
         self.jmp(0x10, reg, imm, target);
     }
+    /// Jumps if dst == src (BPF_JMP | BPF_JEQ | BPF_X).
+    fn jeq_reg(&mut self, dst: u8, src: u8, target: &'static str) {
+        self.fixups.push((self.insns.len(), target));
+        self.i(insn(0x1d, dst, src, 0, 0));
+    }
     fn jne(&mut self, reg: u8, imm: i32, target: &'static str) {
         self.jmp(0x50, reg, imm, target);
     }

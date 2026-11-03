@@ -69,15 +69,23 @@ pub fn scan() -> ProcMap {
     map
 }
 
-/// The pids of every running process whose name (comm) is in `names`.
-pub fn pids_named(names: &HashSet<String>) -> HashSet<u32> {
+/// The pids of every running process whose name (comm) is in `targets`,
+/// run by the uid it maps to. Any user can name a process anything, so the
+/// name alone doesn't say it is the program chosen.
+pub fn pids_matching(targets: &HashMap<String, u32>) -> HashSet<u32> {
     let Ok(dir) = fs::read_dir("/proc") else {
         return HashSet::new();
     };
     dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
         .filter(|pid| {
-            fs::read_to_string(format!("/proc/{pid}/comm"))
-                .is_ok_and(|c| names.contains(c.trim_end_matches('\n')))
+            let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) else {
+                return false;
+            };
+            let Some(&uid) = targets.get(crate::text::clean(comm.trim_end_matches('\n')).as_str())
+            else {
+                return false;
+            };
+            fs::metadata(format!("/proc/{pid}")).is_ok_and(|m| m.uid() == uid)
         })
         .collect()
 }

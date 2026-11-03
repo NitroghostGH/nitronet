@@ -64,6 +64,9 @@ pub struct ProcRow {
     pub name: String,
     pub unit: Option<String>,
     pub user: String,
+    /// The process's uid; None for the kernel, or for a grouped row whose
+    /// processes run as different users.
+    pub uid: Option<u32>,
     /// False once the process has no sockets and no traffic. We keep it for its totals.
     pub alive: bool,
     pub rate_in: f64,
@@ -97,6 +100,7 @@ struct Acc {
     name: String,
     unit: Option<String>,
     user: String,
+    uid: Option<u32>,
     total_in: u64,
     total_out: u64,
 }
@@ -118,8 +122,9 @@ pub struct Sampler {
     acc: HashMap<Owner, Acc>,
     /// Packet capture, running while any program is chosen for it.
     capture: Option<Capture>,
-    capture_names: HashSet<String>,
-    /// Running processes with a captured name, refreshed each sample.
+    /// Captured program names, each with the uid it is captured for.
+    capture_targets: HashMap<String, u32>,
+    /// Running processes with a captured name and uid, refreshed each sample.
     capture_pids: HashSet<u32>,
     pending: Vec<Packet>,
     pending_lost: u64,
@@ -172,7 +177,7 @@ impl Sampler {
             nic_start: None,
             acc: HashMap::new(),
             capture: None,
-            capture_names: HashSet::new(),
+            capture_targets: HashMap::new(),
             capture_pids: HashSet::new(),
             pending: Vec::new(),
             pending_lost: 0,
@@ -199,7 +204,7 @@ impl Sampler {
         let socks = self.diag.dump_all()?;
         let pm = procfs::scan();
         if self.capture.is_some() {
-            self.capture_pids = procfs::pids_named(&self.capture_names);
+            self.capture_pids = procfs::pids_matching(&self.capture_targets);
         }
         let nic = procfs::nic_totals();
         let mut entries = match &self.tracker {
@@ -311,6 +316,7 @@ impl Sampler {
                     name: acc.name.clone(),
                     unit: acc.unit.clone(),
                     user: acc.user.clone(),
+                    uid: acc.uid,
                     alive: false,
                     rate_in: 0.0,
                     rate_out: 0.0,
@@ -391,11 +397,11 @@ impl Sampler {
 
     /// Captures packets from the programs named (as in /proc/<pid>/comm), or
     /// stops capturing when the set is empty. The error is ready to show.
-    pub fn set_capture(&mut self, names: &HashSet<String>) -> Result<(), String> {
-        if names.is_empty() {
+    pub fn set_capture(&mut self, targets: &HashMap<String, u32>) -> Result<(), String> {
+        if targets.is_empty() {
             self.drain_capture();
             self.capture = None;
-            self.capture_names.clear();
+            self.capture_targets.clear();
             self.capture_pids.clear();
             return Ok(());
         }
@@ -418,8 +424,8 @@ impl Sampler {
                     .map_err(|e| format!("can't start capture: {e}"))?,
             );
         }
-        self.capture_names = names.clone();
-        self.capture_pids = procfs::pids_named(names);
+        self.capture_targets = targets.clone();
+        self.capture_pids = procfs::pids_matching(targets);
         self.update_capture_targets();
         Ok(())
     }
@@ -434,14 +440,13 @@ impl Sampler {
             .iter()
             .filter(|(_, o)| {
                 matches!(o, Owner::Pid(_))
-                    && self
-                        .acc
-                        .get(o)
-                        .is_some_and(|a| self.capture_names.contains(&a.name))
+                    && self.acc.get(o).is_some_and(|a| {
+                        a.uid.is_some() && self.capture_targets.get(&a.name) == a.uid.as_ref()
+                    })
             })
             .map(|(c, _)| *c)
             .collect();
-        cap.set_targets(&self.capture_names, &self.capture_pids, &cookies);
+        cap.set_targets(&self.capture_targets, &self.capture_pids, &cookies);
     }
 
     /// Captured packets since the last call, oldest first.
@@ -527,12 +532,13 @@ impl Sampler {
         entry: Option<&Entry>,
     ) -> &'a mut ProcRow {
         live.entry(owner).or_insert_with(|| {
-            let (name, unit, user) = self.describe(owner, pm, uid, entry);
+            let (name, unit, user, uid) = self.describe(owner, pm, uid, entry);
             ProcRow {
                 owner,
                 name,
                 unit,
                 user,
+                uid,
                 alive: true,
                 rate_in: 0.0,
                 rate_out: 0.0,
@@ -552,6 +558,7 @@ fn account(accs: &mut HashMap<Owner, Acc>, owner: Owner, row: &ProcRow, d_in: u6
         name: row.name.clone(),
         unit: row.unit.clone(),
         user: row.user.clone(),
+        uid: row.uid,
         total_in: 0,
         total_out: 0,
     };
@@ -559,7 +566,7 @@ fn account(accs: &mut HashMap<Owner, Acc>, owner: Owner, row: &ProcRow, d_in: u6
     // The pid now runs something else: it was reused by a new process (or
     // the process exec'd another program). Start over, so the new program
     // isn't shown, or captured, under the old one's name and totals.
-    if acc.name != row.name || acc.user != row.user {
+    if acc.name != row.name || acc.uid != row.uid {
         *acc = fresh();
     }
     acc.unit.clone_from(&row.unit);
@@ -590,7 +597,7 @@ impl Sampler {
         pm: &ProcMap,
         uid: u32,
         entry: Option<&Entry>,
-    ) -> (String, Option<String>, String) {
+    ) -> (String, Option<String>, String, Option<u32>) {
         match owner {
             Owner::Pid(pid) => {
                 // Prefer /proc. A process that has exited is known only by eBPF's comm.
@@ -600,7 +607,8 @@ impl Sampler {
                     .cloned()
                     .or_else(|| procfs::read_process(pid))
                 {
-                    return (p.name, p.unit, self.user(p.uid));
+                    let uid = (p.uid != u32::MAX).then_some(p.uid);
+                    return (p.name, p.unit, self.user(p.uid), uid);
                 }
                 let name = entry
                     .map(|e| e.comm.clone())
@@ -608,10 +616,13 @@ impl Sampler {
                     .unwrap_or_else(|| "?".into());
                 let previous = self.acc.get(&owner);
                 match previous {
-                    Some(a) => (a.name.clone(), a.unit.clone(), a.user.clone()),
+                    Some(a) => (a.name.clone(), a.unit.clone(), a.user.clone(), a.uid),
                     // eBPF's uid comes from the creating process. A TIME_WAIT
                     // socket's own uid reads as 0, so prefer eBPF's.
-                    None => (name, None, self.user(entry.map_or(uid, |e| e.uid))),
+                    None => {
+                        let uid = entry.map_or(uid, |e| e.uid);
+                        (name, None, self.user(uid), Some(uid))
+                    }
                 }
             }
             Owner::Uid(uid) => {
@@ -620,9 +631,9 @@ impl Sampler {
                 } else {
                     "(needs root)"
                 };
-                (name.into(), None, self.user(uid))
+                (name.into(), None, self.user(uid), Some(uid))
             }
-            Owner::Kernel => ("(kernel)".into(), None, "-".into()),
+            Owner::Kernel => ("(kernel)".into(), None, "-".into(), None),
         }
     }
 }
@@ -648,6 +659,7 @@ mod tests {
             name: name.into(),
             unit: None,
             user: "nitro".into(),
+            uid: Some(1000),
             alive: true,
             rate_in: 0.0,
             rate_out: 0.0,
@@ -708,7 +720,10 @@ mod live {
     fn live_curl_capture() {
         let mut s = Sampler::new(true).unwrap();
         s.sample().unwrap();
-        s.set_capture(&HashSet::from(["curl".to_string()])).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        s.set_capture(&HashMap::from([("curl".to_string(), uid)]))
+            .unwrap();
         // Unrelated traffic from this process must not show up.
         let _ = std::net::TcpStream::connect("1.1.1.1:80");
         let out = std::process::Command::new("curl")
@@ -750,7 +765,7 @@ mod live {
                 .info
                 .contains("ClientHello → example.com")
         }));
-        s.set_capture(&HashSet::new()).unwrap();
+        s.set_capture(&HashMap::new()).unwrap();
     }
 
     /// The router login case: a program whose connections are opened by a
@@ -766,7 +781,9 @@ mod live {
         let me = me.trim_end().to_string();
         let mut s = Sampler::new(true).unwrap();
         s.sample().unwrap();
-        s.set_capture(&HashSet::from([me.clone()])).unwrap();
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        s.set_capture(&HashMap::from([(me.clone(), uid)])).unwrap();
 
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let to = server.local_addr().unwrap();
@@ -813,6 +830,6 @@ mod live {
             "the first SYN is missing"
         );
         assert!(has("POST /login") && has("password=hunter2"));
-        s.set_capture(&HashSet::new()).unwrap();
+        s.set_capture(&HashMap::new()).unwrap();
     }
 }
