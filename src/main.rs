@@ -4,6 +4,7 @@ mod netlink;
 mod packet;
 mod procfs;
 mod sampler;
+mod text;
 mod ui;
 
 use std::error::Error;
@@ -211,7 +212,8 @@ fn print_devices(s: &lan::LanState) {
         (None, Some(r)) => format!(" + {r} (all-nodes ping)"),
         (None, None) => " + IPv6 link-local (all-nodes ping)".into(),
     };
-    println!("{} on {} · {method}{v6}", iface.range(), iface.name);
+    let ifname = text::clean(&iface.name);
+    println!("{} on {} · {method}{v6}", iface.range(), ifname);
     if let Some(e) = &s.error {
         println!("note: {e}");
     }

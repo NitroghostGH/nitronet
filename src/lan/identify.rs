@@ -46,7 +46,7 @@ fn parse_oui(text: &str) -> HashMap<[u8; 3], String> {
             let (prefix, rest) = l.split_once("(hex)")?;
             let mut b = prefix.trim().split('-').map(|h| u8::from_str_radix(h, 16));
             let key = [b.next()?.ok()?, b.next()?.ok()?, b.next()?.ok()?];
-            Some((key, rest.trim().to_string()))
+            Some((key, crate::text::clean(rest.trim())))
         })
         .collect()
 }

@@ -214,7 +214,7 @@ fn parse_value(v: &[u8]) -> Entry {
         tx: u64_at(V_TX),
         uid: u32_at(V_UID),
         pid: u32_at(V_PID),
-        comm: String::from_utf8_lossy(&comm[..len]).into_owned(),
+        comm: crate::text::clean(&String::from_utf8_lossy(&comm[..len])),
     }
 }
 

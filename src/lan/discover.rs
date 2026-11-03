@@ -877,9 +877,9 @@ pub fn reverse_lookup(ip: IpAddr, scope: u32) -> Option<String> {
         return None;
     }
     // SAFETY: on success getnameinfo wrote a NUL-terminated string.
-    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }
-        .to_string_lossy()
-        .into_owned();
+    let name = unsafe { std::ffi::CStr::from_ptr(host.as_ptr()) }.to_string_lossy();
+    // Names come from DNS, mDNS or LLMNR answers, which anyone can send.
+    let name = crate::text::clean(&name);
     (!name.is_empty() && !restates_address(&name, ip)).then_some(name)
 }
 

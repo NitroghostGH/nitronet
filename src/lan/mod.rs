@@ -236,7 +236,7 @@ fn start_probe(state: &Arc<Mutex<LanState>>, key: DevKey) {
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
-        .map(|s| s.trim().to_string())
+        .map(|s| crate::text::clean(s.trim()))
 }
 
 fn run_scan(state: &Arc<Mutex<LanState>>, vendors: &Vendors, is_root: bool) {

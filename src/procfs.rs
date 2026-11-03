@@ -84,10 +84,12 @@ pub fn pids_named(names: &HashSet<String>) -> HashSet<u32> {
 
 /// Reads a process's name, service and uid. Returns None if it has exited.
 pub fn read_process(pid: u32) -> Option<Process> {
-    let name = fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()?
-        .trim_end()
-        .to_string();
+    // Any user can set their own processes' names, escape codes included.
+    let name = crate::text::clean(
+        fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()?
+            .trim_end_matches('\n'),
+    );
     let unit = fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .ok()
         .and_then(|s| unit_from_cgroup(&s));
@@ -103,7 +105,8 @@ pub fn read_process(pid: u32) -> Option<Process> {
 fn unit_from_cgroup(s: &str) -> Option<String> {
     let path = s.lines().find_map(|l| l.strip_prefix("0::"))?;
     let leaf = path.rsplit('/').next()?;
-    leaf.strip_suffix(".service").map(str::to_string)
+    // Users can create cgroups in their own systemd session, with any name.
+    leaf.strip_suffix(".service").map(crate::text::clean)
 }
 
 /// uid -> user name from /etc/passwd (local users only).
@@ -171,6 +174,11 @@ mod tests {
                 "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox-1.scope\n"
             ),
             None
+        );
+        // A user can name a cgroup in their own session with escape codes.
+        assert_eq!(
+            unit_from_cgroup("0::/user.slice/user@1000.service/\x1b[2Jx.service\n").as_deref(),
+            Some("?[2Jx")
         );
     }
 }
