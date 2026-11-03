@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use super::App;
+use super::query::{Found, Query};
 use crate::packet::{Content, FlowKey, Packet};
 use crate::sampler::Owner;
 
@@ -163,13 +164,14 @@ impl App {
     /// Indices into `app.packets` of the rows to show: filtered, oldest first
     /// (newest first when reversed).
     pub fn pkt_rows(&self) -> Vec<usize> {
+        let q = self.query();
         let mut idx: Vec<usize> = (0..self.packets.len())
             .filter(|&i| {
                 let p = &self.packets[i];
-                self.pkt_passes(p) && self.pkt_matches(p)
+                self.pkt_passes(p) && (q.is_empty() || self.pkt_matches(&q, p))
             })
             .collect();
-        if self.reverse {
+        if self.reverse.pkts {
             idx.reverse();
         }
         idx
@@ -177,39 +179,19 @@ impl App {
 
     /// Whether a packet matches the text filter. Its payload is searched too,
     /// so "/password" finds the packet that carries one.
-    fn pkt_matches(&self, p: &Packet) -> bool {
-        if self.filter.is_empty() {
-            return true;
-        }
-        let pid = match p.owner {
-            Owner::Pid(p) => p.to_string(),
-            _ => String::new(),
-        };
-        let (local, remote) = p
-            .ends()
-            .map(|(l, r)| (l.to_string(), r.to_string()))
-            .unwrap_or_default();
-        let (proto, info) = p
-            .head
-            .as_ref()
-            .map(|d| (d.proto(), d.info.as_str()))
-            .unwrap_or(("?", ""));
-        let content = p.content.label();
-        let secret = p.secret.unwrap_or_default();
-        self.matches_with_bytes(
-            &[
-                &p.program, &pid, &local, &remote, proto, info, &content, secret,
-            ],
-            p.payload(),
-        )
+    fn pkt_matches(&self, q: &Query, p: &Packet) -> bool {
+        let mut f = q.found();
+        pkt_scan(q, &mut f, p);
+        q.passes(&f)
     }
 
     /// The conversations among the packets that pass the filters, sorted.
     pub fn flows(&self) -> Vec<Flow> {
         let mut index: HashMap<FlowKey, usize> = HashMap::new();
         let mut flows: Vec<Flow> = Vec::new();
-        // Conversations with a packet that matches the text filter by itself.
-        let mut hit: Vec<bool> = Vec::new();
+        // What the text filter found in each conversation's packets.
+        let q = self.query();
+        let mut found: Vec<Found> = Vec::new();
         for p in &self.packets {
             if !self.pkt_passes(p) {
                 continue;
@@ -236,11 +218,11 @@ impl App {
                     secrets: 0,
                     secret: None,
                 });
-                hit.push(false);
+                found.push(q.found());
                 flows.len() - 1
             });
-            if !hit[i] && !self.filter.is_empty() {
-                hit[i] = self.pkt_matches(p);
+            if !q.is_empty() {
+                pkt_scan(&q, &mut found[i], p);
             }
             let f = &mut flows[i];
             if p.outgoing {
@@ -274,9 +256,14 @@ impl App {
             }
         }
 
-        let mut hit = hit.into_iter();
+        // A conversation matches when each wanted word is in it somewhere
+        // (its own fields, or any packet), and no excluded word is anywhere.
+        let mut found = found.into_iter();
         flows.retain(|f| {
-            if hit.next() == Some(true) || self.filter.is_empty() {
+            let Some(mut found) = found.next() else {
+                return true;
+            };
+            if q.is_empty() {
                 return true;
             }
             let pid = match f.owner {
@@ -285,7 +272,12 @@ impl App {
             };
             let (local, remote) = (f.key.local.to_string(), f.key.remote.to_string());
             let what = f.what();
-            self.matches(&[&f.key.program, &pid, &local, &remote, f.key.proto, &what])
+            q.scan(
+                &mut found,
+                &[&f.key.program, &pid, &local, &remote, f.key.proto, &what],
+                &[],
+            );
+            q.passes(&found)
         });
         let bytes = |f: &Flow| f.bytes_in + f.bytes_out;
         match self.flow_sort {
@@ -300,9 +292,36 @@ impl App {
                     .then(b.last.cmp(&a.last))
             }),
         }
-        if self.reverse {
+        if self.reverse.flows {
             flows.reverse();
         }
         flows
     }
+}
+
+/// Adds what a packet's fields and payload contain to `f`. The payload is
+/// searched too, so "/password" finds the packet that carries one.
+fn pkt_scan(q: &Query, f: &mut Found, p: &Packet) {
+    let pid = match p.owner {
+        Owner::Pid(p) => p.to_string(),
+        _ => String::new(),
+    };
+    let (local, remote) = p
+        .ends()
+        .map(|(l, r)| (l.to_string(), r.to_string()))
+        .unwrap_or_default();
+    let (proto, info) = p
+        .head
+        .as_ref()
+        .map(|d| (d.proto(), d.info.as_str()))
+        .unwrap_or(("?", ""));
+    let content = p.content.label();
+    let secret = p.secret.unwrap_or_default();
+    q.scan(
+        f,
+        &[
+            &p.program, &pid, &local, &remote, proto, info, &content, secret,
+        ],
+        p.payload(),
+    );
 }

@@ -5,6 +5,7 @@ mod diagram;
 mod fmt;
 mod packets;
 mod packets_view;
+mod query;
 mod theme;
 mod view;
 mod widgets;
@@ -158,6 +159,17 @@ pub(crate) enum Tab {
     Packets,
 }
 
+/// Which lists `r` has reversed. Each list has its own, so reversing one
+/// doesn't flip the others.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Reversed {
+    pub procs: bool,
+    pub socks: bool,
+    pub devs: bool,
+    pub pkts: bool,
+    pub flows: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum DevSort {
     Ip,
@@ -295,7 +307,7 @@ pub(crate) struct App {
     pub tab: Tab,
     pub proc_sort: ProcSort,
     pub sock_sort: SockSort,
-    pub reverse: bool,
+    pub reverse: Reversed,
     pub group_by_program: bool,
     pub listening_only: bool,
     pub paused: bool,
@@ -360,7 +372,7 @@ impl App {
             tab: Tab::Procs,
             proc_sort: ProcSort::Rate,
             sock_sort: SockSort::Rate,
-            reverse: false,
+            reverse: Reversed::default(),
             group_by_program: false,
             listening_only: false,
             paused: false,
@@ -553,7 +565,7 @@ impl App {
 
     /// The row of the newest packet: the last, or the first when reversed.
     fn newest_row(&self, pkts: &[usize]) -> usize {
-        if self.reverse {
+        if self.reverse.pkts {
             0
         } else {
             pkts.len().saturating_sub(1)
@@ -592,14 +604,11 @@ impl App {
         let Some(key) = self.flow_sel.clone() else {
             return;
         };
-        let first = self
-            .packets
-            .iter()
-            .find(|p| p.flow().as_ref() == Some(&key))
-            .map(|p| p.id);
         self.pkt_flow = Some(key);
         self.pkt_flows = false;
-        self.pkt_sel = first;
+        // The top row as shown: `i`, `e` and `/` may hide the conversation's
+        // first packet, and `r` puts the newest on top.
+        self.pkt_sel = self.pkt_rows().first().map(|&i| self.packets[i].id);
     }
 
     /// Back from a conversation's packets to the list of conversations.
@@ -783,7 +792,10 @@ impl App {
             KeyCode::Home => self.move_to(|_, _| 0),
             KeyCode::End => self.move_to(|_, len| len.saturating_sub(1)),
             KeyCode::Char('s') => self.cycle_sort(),
-            KeyCode::Char('r') => self.reverse = !self.reverse,
+            KeyCode::Char('r') => {
+                let r = self.reversed_mut();
+                *r = !*r;
+            }
             KeyCode::Char('g') => self.group_by_program = !self.group_by_program,
             KeyCode::Char('l') => self.listening_only = !self.listening_only,
             KeyCode::Enter | KeyCode::Char('d') => self.show_detail = !self.show_detail,
@@ -849,16 +861,27 @@ impl App {
         }
     }
 
+    /// The reversed flag of the list on screen.
+    fn reversed_mut(&mut self) -> &mut bool {
+        match self.tab {
+            Tab::Procs => &mut self.reverse.procs,
+            Tab::Sockets => &mut self.reverse.socks,
+            Tab::Devices => &mut self.reverse.devs,
+            Tab::Packets if self.pkt_flows => &mut self.reverse.flows,
+            Tab::Packets => &mut self.reverse.pkts,
+        }
+    }
+
     fn cycle_sort(&mut self) {
         match self.tab {
             Tab::Packets if self.pkt_flows => {
-                self.reverse = false;
+                self.reverse.flows = false;
                 self.flow_sort = self.flow_sort.next();
                 return;
             }
             // Packets are always in time order (r reverses).
             Tab::Packets => return,
-            _ => self.reverse = false,
+            _ => *self.reversed_mut() = false,
         }
         match self.tab {
             Tab::Procs => {
@@ -964,7 +987,7 @@ impl App {
             SockSort::State => idx.sort_by_key(|i| (all[*i].sock.state_str(), port_key(i))),
             SockSort::Program => idx.sort_by_key(|i| (name(&all[*i]).to_lowercase(), port_key(i))),
         }
-        if app.reverse {
+        if app.reverse.socks {
             idx.reverse();
         }
         idx
@@ -1025,7 +1048,7 @@ impl App {
                 keys.sort_by_key(|k| (!d(k).online, std::cmp::Reverse(d(k).last_seen)))
             }
         }
-        if self.reverse {
+        if self.reverse.devs {
             keys.reverse();
         }
         keys
@@ -1034,27 +1057,12 @@ impl App {
     /// The filter: every word must appear in some field, and a word starting
     /// with `!` must appear in none ("dns !mdns", "firefox 443").
     pub fn matches(&self, fields: &[&str]) -> bool {
-        self.matches_with_bytes(fields, &[])
+        self.query().matches(fields, &[])
     }
 
-    /// `matches`, where `bytes` (a packet's payload) counts as a field too.
-    pub fn matches_with_bytes(&self, fields: &[&str], bytes: &[u8]) -> bool {
-        if self.filter.trim().is_empty() {
-            return true;
-        }
-        let fields: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
-        let hit = |w: &str| {
-            fields.iter().any(|f| f.contains(w))
-                || crate::packet::find_ignore_case(bytes, w.as_bytes()).is_some()
-        };
-        self.filter
-            .to_lowercase()
-            .split_whitespace()
-            .all(|w| match w.strip_prefix('!') {
-                Some("") => true,
-                Some(not) => !hit(not),
-                None => hit(w),
-            })
+    /// The text filter, parsed.
+    pub fn query(&self) -> query::Query {
+        query::Query::parse(&self.filter)
     }
 
     /// The process rows to show: grouped, filtered and sorted.
@@ -1152,7 +1160,7 @@ impl App {
             }),
             ProcSort::Pid => views.sort_by_key(|v| v.row.owner),
         }
-        if self.reverse {
+        if self.reverse.procs {
             views.reverse();
         }
         views

@@ -563,7 +563,7 @@ fn draw_procs(app: &mut App, f: &mut Frame, area: Rect, views: &[ProcView], tabs
         area,
         block,
         &PROC_COLS,
-        (sorted_col, desc != app.reverse),
+        (sorted_col, desc != app.reverse.procs),
         rows,
         &empty,
     );
@@ -745,7 +745,7 @@ fn draw_sockets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: L
         area,
         block,
         &SOCK_COLS,
-        (sorted_col, desc != app.reverse),
+        (sorted_col, desc != app.reverse.socks),
         rows,
         &empty,
     );
@@ -1294,7 +1294,7 @@ fn draw_devices(app: &mut App, f: &mut Frame, area: Rect, devs: &[DevKey], tabs:
         area,
         block,
         &DEV_COLS,
-        (sorted_col, desc != app.reverse),
+        (sorted_col, desc != app.reverse.devs),
         rows,
         &empty,
     );

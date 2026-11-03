@@ -193,7 +193,7 @@ fn draw_packets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: L
         area,
         block,
         &PKT_COLS,
-        (0, app.reverse),
+        (0, app.reverse.pkts),
         rows,
         &empty,
     );
@@ -272,12 +272,7 @@ fn info_line(t: &Theme, info: &str, content: Content, secret: bool) -> Line<'sta
 
 /// The words of the filter to look for (not the `!` ones), lowercased.
 fn search_words(app: &App) -> Vec<String> {
-    app.filter
-        .to_lowercase()
-        .split_whitespace()
-        .filter(|w| !w.starts_with('!'))
-        .map(str::to_string)
-        .collect()
+    app.query().want
 }
 
 /// Which bytes of `b` are part of a filter match, to highlight them.
@@ -642,7 +637,7 @@ fn draw_flows(app: &mut App, f: &mut Frame, area: Rect, flows: &[Flow], tabs: Li
         area,
         block,
         &FLOW_COLS,
-        (sorted, desc != app.reverse),
+        (sorted, desc != app.reverse.flows),
         rows,
         &empty,
     );

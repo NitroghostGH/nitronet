@@ -1556,3 +1556,54 @@ fn logins_in_clear_are_flagged_and_searchable() {
         assert!(text.contains(want), "missing {want:?}\n{text}");
     }
 }
+
+#[test]
+fn conversations_respect_exclusions_and_open_on_a_shown_packet() {
+    let mut a = app();
+    a.add_packets(login_packets(1000));
+    key(&mut a, KeyCode::Char('4'));
+    key(&mut a, KeyCode::Char('f'));
+    let login = |a: &App| a.flows().into_iter().find(|f| f.key.local.1 == Some(50100));
+    let all = a.flows().len();
+    assert!(login(&a).is_some());
+    // Only the POST has "hunter2". "!hunter2" must still drop the whole
+    // conversation, though its other packets don't contain it.
+    a.filter = "!hunter2".into();
+    assert!(login(&a).is_none());
+    assert_eq!(a.flows().len(), all - 1);
+    // Wanted words can come from different packets of it.
+    a.filter = "hunter2 [S] !nothing-like-this".into();
+    assert_eq!(a.flows().len(), 1);
+    assert!(login(&a).is_some());
+    a.filter.clear();
+
+    // With only packets that carry data shown, the handshake is hidden, so
+    // opening the conversation selects its first shown packet instead.
+    key(&mut a, KeyCode::Char('e'));
+    a.flow_sel = Some(login(&a).unwrap().key);
+    key(&mut a, KeyCode::Enter);
+    assert!(!a.pkt_flows);
+    let rows = a.pkt_rows();
+    let sel = a.pkt_sel.expect("a packet is selected");
+    assert_eq!(a.packets[rows[0]].id, sel);
+    let p = a.packets.iter().find(|p| p.id == sel).unwrap();
+    assert!(p.head.as_ref().unwrap().payload_len > 0);
+}
+
+#[test]
+fn r_reverses_only_the_list_on_screen() {
+    let mut a = app();
+    a.add_packets(login_packets(1000));
+    key(&mut a, KeyCode::Char('1'));
+    key(&mut a, KeyCode::Char('r'));
+    key(&mut a, KeyCode::Char('4'));
+    key(&mut a, KeyCode::Char('f'));
+    key(&mut a, KeyCode::Char('r'));
+    let r = a.reverse;
+    assert!(r.procs && r.flows);
+    assert!(!r.socks && !r.devs && !r.pkts);
+    // s resets only its own list's order.
+    key(&mut a, KeyCode::Char('1'));
+    key(&mut a, KeyCode::Char('s'));
+    assert!(!a.reverse.procs && a.reverse.flows);
+}
