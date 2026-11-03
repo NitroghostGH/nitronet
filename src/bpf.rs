@@ -79,7 +79,7 @@ pub struct Entry {
 }
 
 pub struct Tracker {
-    map: OwnedFd,
+    map: Map,
     /// True when the sock_create program loaded, so new sockets record their pid.
     pub tracks_creators: bool,
     // Dropping these detaches the programs.
@@ -89,7 +89,13 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn start() -> io::Result<Self> {
-        let map = create_map()?;
+        let map = Map::create(
+            BPF_MAP_TYPE_LRU_HASH,
+            8,
+            VALUE_SIZE,
+            MAX_ENTRIES,
+            "nitronet",
+        )?;
         let fd = map.as_raw_fd();
 
         let ingress = load(
@@ -168,7 +174,10 @@ impl Tracker {
             .u64(24, values.as_mut_ptr() as u64)
             .u32(32, CHUNK as u32)
             .u32(36, self.map.as_raw_fd() as u32);
-            let res = sys_bpf(BPF_MAP_LOOKUP_BATCH, &mut a);
+            // SAFETY: the kernel writes at most CHUNK keys (8 bytes each, the
+            // map's key size) and CHUNK values (VALUE_SIZE each) into buffers
+            // that size, and one bucket token (4 bytes) into an 8-byte one.
+            let res = unsafe { sys_bpf(BPF_MAP_LOOKUP_BATCH, &mut a) };
             let count = a.get_u32(32) as usize;
             for i in 0..count.min(CHUNK) {
                 out.insert(
@@ -189,7 +198,8 @@ impl Tracker {
     /// The entry for one socket, if eBPF has seen it.
     pub fn lookup(&self, cookie: u64) -> Option<Entry> {
         let mut v = [0u8; VALUE_SIZE];
-        map_lookup(&self.map, &cookie.to_ne_bytes(), &mut v)
+        self.map
+            .lookup(&cookie.to_ne_bytes(), &mut v)
             .ok()
             .map(|()| parse_value(&v))
     }
@@ -200,7 +210,7 @@ impl Tracker {
     }
 
     pub fn remove(&self, cookie: u64) {
-        map_delete(&self.map, &cookie.to_ne_bytes());
+        self.map.delete(&cookie.to_ne_bytes());
     }
 }
 
@@ -461,9 +471,14 @@ impl Attr {
     }
 }
 
-fn sys_bpf(cmd: libc::c_long, attr: &mut Attr) -> io::Result<RawFd> {
-    // SAFETY: attr is a live, zero-padded bpf_attr. Any pointers stored in it
-    // point to buffers that outlive this call.
+/// # Safety
+///
+/// Every pointer stored in `attr` must be valid for what `cmd` does with it:
+/// the kernel reads or writes through them, for lengths it takes from `attr`
+/// or from the map or program `attr` names.
+unsafe fn sys_bpf(cmd: libc::c_long, attr: &mut Attr) -> io::Result<RawFd> {
+    // SAFETY: attr is a live, zero-padded bpf_attr; the caller vouches for
+    // the pointers in it.
     let r = unsafe { libc::syscall(libc::SYS_bpf, cmd, attr.0.as_mut_ptr(), attr.0.len()) };
     if r < 0 {
         Err(io::Error::last_os_error())
@@ -472,52 +487,92 @@ fn sys_bpf(cmd: libc::c_long, attr: &mut Attr) -> io::Result<RawFd> {
     }
 }
 
-fn sys_bpf_fd(cmd: libc::c_long, attr: &mut Attr) -> io::Result<OwnedFd> {
-    let fd = sys_bpf(cmd, attr)?;
+/// sys_bpf for commands that return a new fd.
+///
+/// # Safety
+///
+/// As for `sys_bpf`.
+unsafe fn sys_bpf_fd(cmd: libc::c_long, attr: &mut Attr) -> io::Result<OwnedFd> {
+    // SAFETY: passed on from the caller.
+    let fd = unsafe { sys_bpf(cmd, attr) }?;
     // SAFETY: on success these commands return a new fd that we own.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn create_map() -> io::Result<OwnedFd> {
-    let mut a = Attr::new();
-    a.u32(0, BPF_MAP_TYPE_LRU_HASH)
-        .u32(4, 8)
-        .u32(8, VALUE_SIZE as u32)
-        .u32(12, MAX_ENTRIES);
-    a.0[28..28 + 8].copy_from_slice(b"nitronet");
-    sys_bpf_fd(BPF_MAP_CREATE, &mut a).map_err(|e| context(e, "creating eBPF map"))
+/// An eBPF map that knows its key and value sizes. The kernel reads and
+/// writes that many bytes through the pointers it is given, so every access
+/// checks the buffers first: a wrong size is an error, not memory corruption.
+struct Map {
+    fd: OwnedFd,
+    key: usize,
+    value: usize,
 }
 
-/// Creates a map other than the main one.
-fn new_map(ty: u32, key: u32, value: u32, max: u32, name: &str) -> io::Result<OwnedFd> {
-    let mut a = Attr::new();
-    a.u32(0, ty).u32(4, key).u32(8, value).u32(12, max);
-    let n = name.len().min(15);
-    a.0[28..28 + n].copy_from_slice(&name.as_bytes()[..n]);
-    sys_bpf_fd(BPF_MAP_CREATE, &mut a).map_err(|e| context(e, &format!("creating eBPF map {name}")))
+impl AsRawFd for Map {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
 }
 
-fn map_lookup(map: &OwnedFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
-    let mut a = Attr::new();
-    a.u32(0, map.as_raw_fd() as u32)
-        .u64(8, key.as_ptr() as u64)
-        .u64(16, value.as_mut_ptr() as u64);
-    sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a).map(|_| ())
-}
+impl Map {
+    fn create(ty: u32, key: usize, value: usize, max: u32, name: &str) -> io::Result<Self> {
+        let mut a = Attr::new();
+        a.u32(0, ty)
+            .u32(4, key as u32)
+            .u32(8, value as u32)
+            .u32(12, max);
+        let n = name.len().min(15);
+        a.0[28..28 + n].copy_from_slice(&name.as_bytes()[..n]);
+        // SAFETY: BPF_MAP_CREATE takes no pointers.
+        let fd = unsafe { sys_bpf_fd(BPF_MAP_CREATE, &mut a) }
+            .map_err(|e| context(e, &format!("creating eBPF map {name}")))?;
+        Ok(Self { fd, key, value })
+    }
 
-fn map_update(map: &OwnedFd, key: &[u8], value: &[u8]) -> io::Result<()> {
-    let mut a = Attr::new();
-    a.u32(0, map.as_raw_fd() as u32)
-        .u64(8, key.as_ptr() as u64)
-        .u64(16, value.as_ptr() as u64)
-        .u64(24, BPF_ANY as u64);
-    sys_bpf(BPF_MAP_UPDATE_ELEM, &mut a).map(|_| ())
-}
+    fn check(&self, key: usize, value: Option<usize>) -> io::Result<()> {
+        if key != self.key || value.is_some_and(|v| v != self.value) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "eBPF map access with key {key} / value {value:?} bytes, map has {} / {}",
+                    self.key, self.value
+                ),
+            ));
+        }
+        Ok(())
+    }
 
-fn map_delete(map: &OwnedFd, key: &[u8]) {
-    let mut a = Attr::new();
-    a.u32(0, map.as_raw_fd() as u32).u64(8, key.as_ptr() as u64);
-    let _ = sys_bpf(BPF_MAP_DELETE_ELEM, &mut a);
+    fn lookup(&self, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+        self.check(key.len(), Some(value.len()))?;
+        let mut a = Attr::new();
+        a.u32(0, self.fd.as_raw_fd() as u32)
+            .u64(8, key.as_ptr() as u64)
+            .u64(16, value.as_mut_ptr() as u64);
+        // SAFETY: key and value are exactly the map's key and value sizes.
+        unsafe { sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a) }.map(|_| ())
+    }
+
+    fn update(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        self.check(key.len(), Some(value.len()))?;
+        let mut a = Attr::new();
+        a.u32(0, self.fd.as_raw_fd() as u32)
+            .u64(8, key.as_ptr() as u64)
+            .u64(16, value.as_ptr() as u64)
+            .u64(24, BPF_ANY as u64);
+        // SAFETY: key and value are exactly the map's key and value sizes.
+        unsafe { sys_bpf(BPF_MAP_UPDATE_ELEM, &mut a) }.map(|_| ())
+    }
+
+    fn delete(&self, key: &[u8]) {
+        if self.check(key.len(), None).is_err() {
+            return;
+        }
+        let mut a = Attr::new();
+        a.u32(0, self.fd.as_raw_fd() as u32)
+            .u64(8, key.as_ptr() as u64);
+        // SAFETY: key is exactly the map's key size.
+        let _ = unsafe { sys_bpf(BPF_MAP_DELETE_ELEM, &mut a) };
+    }
 }
 
 fn load(prog_type: u32, attach_type: u32, insns: &[Insn], name: &str) -> io::Result<OwnedFd> {
@@ -536,7 +591,9 @@ fn load(prog_type: u32, attach_type: u32, insns: &[Insn], name: &str) -> io::Res
                 .u32(28, log.len() as u32)
                 .u64(32, log.as_mut_ptr() as u64);
         }
-        sys_bpf_fd(BPF_PROG_LOAD, &mut a)
+        // SAFETY: insns, LICENSE (NUL-terminated) and the log buffer are
+        // live for the stated lengths.
+        unsafe { sys_bpf_fd(BPF_PROG_LOAD, &mut a) }
     };
     attempt(None).map_err(|e| {
         // Load again with the verifier log on, to explain the failure.
@@ -572,7 +629,9 @@ fn dry_run(prog: &OwnedFd) -> io::Result<()> {
         .u32(8, pkt.len() as u32)
         .u64(16, pkt.as_ptr() as u64)
         .u32(32, 2);
-    sys_bpf(BPF_PROG_TEST_RUN, &mut a).map_err(|e| context(e, "dry-running eBPF program"))?;
+    // SAFETY: pkt is live for the stated length; no output buffers are given.
+    unsafe { sys_bpf(BPF_PROG_TEST_RUN, &mut a) }
+        .map_err(|e| context(e, "dry-running eBPF program"))?;
     match a.get_u32(4) {
         1 => Ok(()),
         r => Err(io::Error::other(format!(
@@ -606,7 +665,9 @@ fn link(prog: &OwnedFd, cgroup: &OwnedFd, attach_type: u32) -> io::Result<OwnedF
     a.u32(0, prog.as_raw_fd() as u32)
         .u32(4, cgroup.as_raw_fd() as u32)
         .u32(8, attach_type);
-    sys_bpf_fd(BPF_LINK_CREATE, &mut a).map_err(|e| context(e, "attaching eBPF program to cgroup"))
+    // SAFETY: BPF_LINK_CREATE for a cgroup takes no pointers.
+    unsafe { sys_bpf_fd(BPF_LINK_CREATE, &mut a) }
+        .map_err(|e| context(e, "attaching eBPF program to cgroup"))
 }
 
 fn context(e: io::Error, what: &str) -> io::Error {
@@ -616,6 +677,22 @@ fn context(e: io::Error, what: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_access_with_wrong_sizes_is_refused() {
+        // Not a real map: the size check fails before any syscall.
+        let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let m = Map {
+            fd,
+            key: 8,
+            value: VALUE_SIZE,
+        };
+        let mut small = [0u8; 8];
+        let e = m.lookup(&0u64.to_ne_bytes(), &mut small).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let e = m.update(&0u32.to_ne_bytes(), &[0; VALUE_SIZE]).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn jumps_resolve_and_programs_end_in_allow() {

@@ -70,10 +70,10 @@ pub struct RawPacket {
 }
 
 pub struct Capture {
-    socks: OwnedFd,
-    comms: OwnedFd,
-    pids: OwnedFd,
-    drops: OwnedFd,
+    socks: Map,
+    comms: Map,
+    pids: Map,
+    drops: Map,
     cur_socks: HashSet<u64>,
     cur_comms: HashSet<([u8; 16], u32)>,
     cur_pids: HashSet<u32>,
@@ -88,13 +88,13 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub(super) fn start(main: &OwnedFd) -> io::Result<Self> {
-        let socks = new_map(BPF_MAP_TYPE_HASH, 8, 1, 16384, "nn_cap_socks")?;
+    pub(super) fn start(main: &Map) -> io::Result<Self> {
+        let socks = Map::create(BPF_MAP_TYPE_HASH, 8, 1, 16384, "nn_cap_socks")?;
         // comm -> the uid it is captured for
-        let comms = new_map(BPF_MAP_TYPE_HASH, 16, 4, 256, "nn_cap_comms")?;
-        let pids = new_map(BPF_MAP_TYPE_HASH, 4, 1, 4096, "nn_cap_pids")?;
-        let drops = new_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "nn_cap_drops")?;
-        let ring = new_map(BPF_MAP_TYPE_RINGBUF, 0, 0, RING, "nn_cap_ring")?;
+        let comms = Map::create(BPF_MAP_TYPE_HASH, 16, 4, 256, "nn_cap_comms")?;
+        let pids = Map::create(BPF_MAP_TYPE_HASH, 4, 1, 4096, "nn_cap_pids")?;
+        let drops = Map::create(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "nn_cap_drops")?;
+        let ring = Map::create(BPF_MAP_TYPE_RINGBUF, 0, 0, RING, "nn_cap_ring")?;
         let maps = Maps {
             main: main.as_raw_fd(),
             socks: socks.as_raw_fd(),
@@ -117,7 +117,7 @@ impl Capture {
         )?;
         dry_run(&ingress)?;
         dry_run(&egress)?;
-        let ring = Ring::map(ring)?;
+        let ring = Ring::map(ring.fd)?;
 
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let lost = Arc::new(AtomicU64::new(0));
@@ -185,7 +185,7 @@ impl Capture {
     /// Packets matched but not kept because a buffer was full.
     pub fn dropped(&self) -> u64 {
         let mut v = [0u8; 8];
-        let kernel = match map_lookup(&self.drops, &0u32.to_ne_bytes(), &mut v) {
+        let kernel = match self.drops.lookup(&0u32.to_ne_bytes(), &mut v) {
             Ok(()) => u64::from_ne_bytes(v),
             Err(_) => 0,
         };
@@ -208,19 +208,19 @@ impl Drop for Capture {
 /// an entry's (key, value). A full map just means some entries are missing,
 /// so failed inserts are skipped and tried again next time.
 fn sync<K: Copy + Eq + std::hash::Hash>(
-    map: &OwnedFd,
+    map: &Map,
     cur: &mut HashSet<K>,
     want: &HashSet<K>,
     bytes: impl Fn(&K) -> (Vec<u8>, Vec<u8>),
 ) {
     // Deletes go first, so an entry whose value changed is written afresh.
     for k in cur.difference(want) {
-        map_delete(map, &bytes(k).0);
+        map.delete(&bytes(k).0);
     }
     cur.retain(|k| want.contains(k));
     for k in want {
         let (key, value) = bytes(k);
-        if !cur.contains(k) && map_update(map, &key, &value).is_ok() {
+        if !cur.contains(k) && map.update(&key, &value).is_ok() {
             cur.insert(*k);
         }
     }
@@ -400,19 +400,29 @@ impl Ring {
                 &*(self.producer as *const AtomicU64),
             )
         };
+        // SAFETY: the data pages follow the producer page in the same mapping.
         let data = unsafe { self.producer.add(self.page) };
         let mask = RING as u64 - 1;
         let mut cons = cons_pos.load(Ordering::Acquire);
         let prod = prod_pos.load(Ordering::Acquire);
         while cons < prod {
-            // SAFETY: (cons & mask) + 8 + len stays inside the double mapping.
+            // SAFETY: cons & mask is inside the ring, and record headers are
+            // 8-byte aligned.
             let hdr = unsafe { &*(data.add((cons & mask) as usize) as *const AtomicU32) };
             let word = hdr.load(Ordering::Acquire);
             if word & RINGBUF_BUSY != 0 {
                 break; // still being written
             }
             let len = (word & !(RINGBUF_BUSY | RINGBUF_DISCARD)) as usize;
+            // Our program only reserves RECORD bytes. Anything longer means
+            // the ring is not what we think it is: stop rather than read past it.
+            if len > RECORD {
+                break;
+            }
             if word & RINGBUF_DISCARD == 0 {
+                // SAFETY: the record is at most RECORD bytes, and the data
+                // pages are mapped twice, so a record that wraps around the
+                // end is still contiguous here.
                 let rec = unsafe {
                     std::slice::from_raw_parts(data.add((cons & mask) as usize + 8), len)
                 };
