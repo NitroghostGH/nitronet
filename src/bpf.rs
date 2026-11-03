@@ -19,15 +19,23 @@ use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+mod capture;
+pub use capture::{Capture, RawPacket};
+
 // bpf(2) commands
 const BPF_MAP_CREATE: libc::c_long = 0;
+const BPF_MAP_LOOKUP_ELEM: libc::c_long = 1;
+const BPF_MAP_UPDATE_ELEM: libc::c_long = 2;
 const BPF_MAP_DELETE_ELEM: libc::c_long = 3;
 const BPF_PROG_LOAD: libc::c_long = 5;
 const BPF_PROG_TEST_RUN: libc::c_long = 10;
 const BPF_MAP_LOOKUP_BATCH: libc::c_long = 24;
 const BPF_LINK_CREATE: libc::c_long = 28;
 
+const BPF_MAP_TYPE_HASH: u32 = 1;
+const BPF_MAP_TYPE_ARRAY: u32 = 2;
 const BPF_MAP_TYPE_LRU_HASH: u32 = 9;
+const BPF_MAP_TYPE_RINGBUF: u32 = 27;
 const BPF_PROG_TYPE_CGROUP_SKB: u32 = 8;
 const BPF_PROG_TYPE_CGROUP_SOCK: u32 = 9;
 const BPF_CGROUP_INET_INGRESS: u32 = 0;
@@ -37,11 +45,15 @@ const BPF_CGROUP_INET_SOCK_CREATE: u32 = 2;
 // helper function ids
 const FN_MAP_LOOKUP_ELEM: i32 = 1;
 const FN_MAP_UPDATE_ELEM: i32 = 2;
+const FN_KTIME_GET_NS: i32 = 5;
 const FN_GET_CURRENT_PID_TGID: i32 = 14;
 const FN_GET_CURRENT_UID_GID: i32 = 15;
 const FN_GET_CURRENT_COMM: i32 = 16;
 const FN_GET_SOCKET_COOKIE: i32 = 46;
+const FN_SKB_LOAD_BYTES: i32 = 26;
 const FN_GET_SOCKET_UID: i32 = 47;
+const FN_RINGBUF_RESERVE: i32 = 131;
+const FN_RINGBUF_SUBMIT: i32 = 132;
 const BPF_ANY: i32 = 0;
 const BPF_NOEXIST: i32 = 1;
 
@@ -174,11 +186,21 @@ impl Tracker {
         }
     }
 
+    /// The entry for one socket, if eBPF has seen it.
+    pub fn lookup(&self, cookie: u64) -> Option<Entry> {
+        let mut v = [0u8; VALUE_SIZE];
+        map_lookup(&self.map, &cookie.to_ne_bytes(), &mut v)
+            .ok()
+            .map(|()| parse_value(&v))
+    }
+
+    /// Starts capturing packets for chosen programs. See `capture.rs`.
+    pub fn capture(&self) -> io::Result<Capture> {
+        Capture::start(&self.map)
+    }
+
     pub fn remove(&self, cookie: u64) {
-        let mut a = Attr::new();
-        a.u32(0, self.map.as_raw_fd() as u32)
-            .u64(8, (&raw const cookie) as u64);
-        let _ = sys_bpf(BPF_MAP_DELETE_ELEM, &mut a);
+        map_delete(&self.map, &cookie.to_ne_bytes());
     }
 }
 
@@ -283,6 +305,8 @@ const R2: u8 = 2;
 const R3: u8 = 3;
 const R4: u8 = 4;
 const R6: u8 = 6;
+const R7: u8 = 7;
+const R8: u8 = 8;
 const R10: u8 = 10;
 
 const fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Insn {
@@ -307,6 +331,12 @@ const fn rsh_imm(dst: u8, imm: i32) -> Insn {
 }
 const fn ldx_w(dst: u8, src: u8, off: i16) -> Insn {
     insn(0x61, dst, src, off, 0)
+}
+const fn ldx_dw(dst: u8, src: u8, off: i16) -> Insn {
+    insn(0x79, dst, src, off, 0)
+}
+const fn st_w(dst: u8, off: i16, imm: i32) -> Insn {
+    insn(0x62, dst, 0, off, imm)
 }
 const fn stx_dw(dst: u8, off: i16, src: u8) -> Insn {
     insn(0x7b, dst, src, off, 0)
@@ -343,9 +373,24 @@ impl Asm {
     fn label(&mut self, name: &'static str) {
         self.labels.insert(name, self.insns.len());
     }
-    fn jeq(&mut self, reg: u8, imm: i32, target: &'static str) {
+    /// A conditional jump comparing `reg` with `imm` (BPF_JMP | op | BPF_K).
+    fn jmp(&mut self, op: u8, reg: u8, imm: i32, target: &'static str) {
         self.fixups.push((self.insns.len(), target));
-        self.i(insn(0x15, reg, 0, 0, imm));
+        self.i(insn(op | 0x05, reg, 0, 0, imm));
+    }
+    fn jeq(&mut self, reg: u8, imm: i32, target: &'static str) {
+        self.jmp(0x10, reg, imm, target);
+    }
+    fn jne(&mut self, reg: u8, imm: i32, target: &'static str) {
+        self.jmp(0x50, reg, imm, target);
+    }
+    /// Unsigned reg < imm.
+    fn jlt(&mut self, reg: u8, imm: i32, target: &'static str) {
+        self.jmp(0xa0, reg, imm, target);
+    }
+    /// Unsigned reg <= imm.
+    fn jle(&mut self, reg: u8, imm: i32, target: &'static str) {
+        self.jmp(0xb0, reg, imm, target);
     }
     fn ja(&mut self, target: &'static str) {
         self.fixups.push((self.insns.len(), target));
@@ -436,6 +481,38 @@ fn create_map() -> io::Result<OwnedFd> {
         .u32(12, MAX_ENTRIES);
     a.0[28..28 + 8].copy_from_slice(b"nitronet");
     sys_bpf_fd(BPF_MAP_CREATE, &mut a).map_err(|e| context(e, "creating eBPF map"))
+}
+
+/// Creates a map other than the main one.
+fn new_map(ty: u32, key: u32, value: u32, max: u32, name: &str) -> io::Result<OwnedFd> {
+    let mut a = Attr::new();
+    a.u32(0, ty).u32(4, key).u32(8, value).u32(12, max);
+    let n = name.len().min(15);
+    a.0[28..28 + n].copy_from_slice(&name.as_bytes()[..n]);
+    sys_bpf_fd(BPF_MAP_CREATE, &mut a).map_err(|e| context(e, &format!("creating eBPF map {name}")))
+}
+
+fn map_lookup(map: &OwnedFd, key: &[u8], value: &mut [u8]) -> io::Result<()> {
+    let mut a = Attr::new();
+    a.u32(0, map.as_raw_fd() as u32)
+        .u64(8, key.as_ptr() as u64)
+        .u64(16, value.as_mut_ptr() as u64);
+    sys_bpf(BPF_MAP_LOOKUP_ELEM, &mut a).map(|_| ())
+}
+
+fn map_update(map: &OwnedFd, key: &[u8], value: &[u8]) -> io::Result<()> {
+    let mut a = Attr::new();
+    a.u32(0, map.as_raw_fd() as u32)
+        .u64(8, key.as_ptr() as u64)
+        .u64(16, value.as_ptr() as u64)
+        .u64(24, BPF_ANY as u64);
+    sys_bpf(BPF_MAP_UPDATE_ELEM, &mut a).map(|_| ())
+}
+
+fn map_delete(map: &OwnedFd, key: &[u8]) {
+    let mut a = Attr::new();
+    a.u32(0, map.as_raw_fd() as u32).u64(8, key.as_ptr() as u64);
+    let _ = sys_bpf(BPF_MAP_DELETE_ELEM, &mut a);
 }
 
 fn load(prog_type: u32, attach_type: u32, insns: &[Insn], name: &str) -> io::Result<OwnedFd> {
@@ -543,7 +620,7 @@ mod tests {
             assert_eq!((prog[n - 2].code, prog[n - 2].imm), (0xb7, 1));
             assert_eq!(prog[n - 1].code, 0x95);
             for (i, ins) in prog.iter().enumerate() {
-                if ins.code == 0x15 || ins.code == 0x05 {
+                if ins.code & 0x07 == 0x05 && ins.code != 0x85 && ins.code != 0x95 {
                     let t = i as isize + 1 + ins.off as isize;
                     assert!(ins.off > 0 && (t as usize) < n, "jump at {i} lands at {t}");
                 }

@@ -15,6 +15,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::App;
 use crate::netlink::{Proto, SockInfo};
+use crate::packet::Content;
 use crate::sampler::{Owner, ProcRow, Snapshot, SockRow, Source};
 
 struct P {
@@ -468,14 +469,146 @@ pub(crate) fn lan_fixture() -> crate::lan::LanState {
     s
 }
 
-/// An app with 300 samples of history and a scanned LAN.
+/// An app with 300 samples of history, a scanned LAN, and packets captured
+/// from curl and firefox.
 fn app() -> App {
     let mut app = App::new(fixture(0), Duration::from_secs(1));
     for k in 1..300 {
         app.set_snapshot(fixture(k));
     }
     app.lan_state = lan_fixture();
+    app.capturing = ["curl".to_string(), "firefox".to_string()].into();
+    app.add_packets(packet_fixture(0));
     app
+}
+
+/// A curl HTTPS request (DNS, handshake, TLS) and some firefox traffic.
+pub(crate) fn packet_fixture(first_id: u64) -> Vec<crate::packet::Packet> {
+    use crate::packet::tests::{client_hello, dns_query, ipv4};
+    use crate::packet::{Packet, decode};
+    const TCP: u8 = 6;
+    const UDP: u8 = 17;
+    let me = [192, 168, 0, 74];
+    let site = [93, 184, 215, 14];
+    let stub = [127, 0, 0, 53];
+    let mut answer = dns_query("example.com", 1);
+    answer[2] = 0x81;
+    answer[3] = 0x80;
+    answer[7] = 1;
+    answer.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 215, 14]);
+    let mut server_hello = vec![22, 3, 3, 0, 90, 2, 0, 0, 86];
+    server_hello.extend_from_slice(&[0; 90]);
+    let mut tls_data = vec![23, 3, 3, 5, 120];
+    tls_data.extend((0..300).map(|i| (i * 37 % 256) as u8));
+    let mut ipv6 = vec![0u8; 40 + 20 + 5];
+    ipv6[0] = 0x60;
+    ipv6[6] = TCP;
+    ipv6[7] = 58;
+    let a: std::net::Ipv6Addr = "2001:db8:322e:0:32c5:99ff:feaa:bb02".parse().unwrap();
+    let b: std::net::Ipv6Addr = "2600:9000:246a:4400:1:a3fa:7cc0:93a1".parse().unwrap();
+    ipv6[8..24].copy_from_slice(&a.octets());
+    ipv6[24..40].copy_from_slice(&b.octets());
+    ipv6[40..42].copy_from_slice(&37422u16.to_be_bytes());
+    ipv6[42..44].copy_from_slice(&443u16.to_be_bytes());
+    ipv6[52] = 5 << 4;
+    ipv6[53] = 0x18;
+    ipv6[60..65].copy_from_slice(&[23, 3, 3, 0, 0]);
+
+    let curl = (Owner::Pid(1203344), "curl");
+    let firefox = (Owner::Pid(1050831), "firefox");
+    // (program, outgoing, bytes, wire length or 0 for all of them)
+    type Sample<'a> = ((Owner, &'a str), bool, Vec<u8>, u32);
+    let list: Vec<Sample> = vec![
+        (
+            curl,
+            true,
+            ipv4(UDP, me, stub, 40112, 53, 0, &dns_query("example.com", 1)),
+            0,
+        ),
+        (curl, false, ipv4(UDP, stub, me, 53, 40112, 0, &answer), 0),
+        (curl, true, ipv4(TCP, me, site, 51644, 443, 0x02, &[]), 0),
+        (curl, false, ipv4(TCP, site, me, 443, 51644, 0x12, &[]), 0),
+        (curl, true, ipv4(TCP, me, site, 51644, 443, 0x10, &[]), 0),
+        (
+            curl,
+            true,
+            ipv4(
+                TCP,
+                me,
+                site,
+                51644,
+                443,
+                0x18,
+                &client_hello("example.com"),
+            ),
+            0,
+        ),
+        (
+            curl,
+            false,
+            ipv4(TCP, site, me, 443, 51644, 0x18, &server_hello),
+            0,
+        ),
+        (
+            curl,
+            false,
+            ipv4(TCP, site, me, 443, 51644, 0x18, &tls_data),
+            2920,
+        ),
+        (
+            firefox,
+            true,
+            ipv4(
+                UDP,
+                me,
+                [142, 250, 70, 206],
+                56519,
+                443,
+                0,
+                &[0xc3, 0, 0, 0, 1, 8],
+            ),
+            1250,
+        ),
+        (
+            firefox,
+            true,
+            ipv4(
+                TCP,
+                me,
+                [192, 168, 0, 31],
+                41822,
+                8080,
+                0x18,
+                b"GET /status HTTP/1.1\r\nHost: nas\r\n\r\n",
+            ),
+            0,
+        ),
+        (firefox, true, ipv6, 0),
+        (curl, true, ipv4(TCP, me, site, 51644, 443, 0x11, &[]), 0),
+    ];
+    let start = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+    let mut classifier = crate::packet::Classifier::default();
+    list.into_iter()
+        .enumerate()
+        .map(|(i, ((owner, name), outgoing, data, len))| {
+            let len = if len == 0 { data.len() as u32 } else { len };
+            Packet {
+                id: first_id + i as u64,
+                at: start + Duration::from_millis(first_id * 1000 + i as u64 * 37),
+                owner,
+                program: name.into(),
+                outgoing,
+                len,
+                head: decode(&data, len),
+                data,
+                content: crate::packet::Content::Empty,
+            }
+        })
+        .map(|mut p| {
+            classifier.apply(&mut p);
+            p
+        })
+        .collect()
 }
 
 fn key(app: &mut App, c: KeyCode) {
@@ -524,6 +657,11 @@ fn renders_everywhere() {
         key(&mut a, KeyCode::Char('3'));
         render(&mut a, w, h);
         key(&mut a, KeyCode::Char('s'));
+        render(&mut a, w, h);
+        key(&mut a, KeyCode::Char('4'));
+        render(&mut a, w, h);
+        key(&mut a, KeyCode::Up);
+        key(&mut a, KeyCode::Char(']'));
         render(&mut a, w, h);
         key(&mut a, KeyCode::Char('?'));
         render(&mut a, w, h);
@@ -685,6 +823,45 @@ fn snapshots() {
             &[KeyCode::Char('3'), KeyCode::Down, KeyCode::Down],
         ),
         ("devices-nas", 180, 46, &[KeyCode::Char('3'), KeyCode::Down]),
+        (
+            "packets",
+            180,
+            46,
+            &[
+                KeyCode::Char('4'),
+                KeyCode::Up,
+                KeyCode::Up,
+                KeyCode::Up,
+                KeyCode::Up,
+                KeyCode::Up,
+                KeyCode::Up,
+            ],
+        ),
+        ("packets-newest", 120, 34, &[KeyCode::Char('4')]),
+        (
+            "packets-unencrypted-text",
+            180,
+            46,
+            &[
+                KeyCode::Char('4'),
+                KeyCode::Char('e'),
+                KeyCode::Char('e'),
+                KeyCode::Char('t'),
+            ],
+        ),
+        (
+            "packets-conversations",
+            180,
+            46,
+            &[KeyCode::Char('4'), KeyCode::Char('f'), KeyCode::Down],
+        ),
+        (
+            "diagram-packets",
+            180,
+            60,
+            &[KeyCode::Char('4'), KeyCode::Char('H')],
+        ),
+        ("packets-small", 80, 24, &[KeyCode::Char('4'), KeyCode::Up]),
         ("diagram", 180, 46, &[KeyCode::Char('H')]),
         (
             "diagram-small",
@@ -941,6 +1118,8 @@ fn diagram_opens_scrolls_and_closes() {
         "ff02::1",
         "ARP who-has",
         "11 devices online, 4 with IPv6",
+        "PACKETS",
+        "capturing curl, firefox · 12 packets",
     ] {
         assert!(text.contains(want), "missing {want:?}");
     }
@@ -977,6 +1156,276 @@ fn diagram_boxes_line_up() {
             if text.starts_with('│') || text.starts_with('╰') {
                 assert_eq!(Some(l.width()), width, "misaligned at width {w}: {text:?}");
             }
+        }
+    }
+}
+
+#[test]
+fn packets_tab_lists_follows_and_filters() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    for want in [
+        "Packets 12",
+        "capturing curl, firefox",
+        "A? example.com",
+        "A example.com → 93.184.215.14",
+        "TLS ClientHello → example.com",
+        "GET /status HTTP/1.1",
+        "QUIC Initial",
+        "[S.]",
+        "7cc0:93a1]:443",
+        "BYTES",
+    ] {
+        assert!(text.contains(want), "missing {want:?}");
+    }
+    // The newest packet is selected, and stays selected as more arrive.
+    let newest = |a: &App| a.packets.back().unwrap().id;
+    let sel = |a: &App| {
+        let rows = a.pkt_rows();
+        a.packets[rows[a.pkt_state.selected().unwrap()]].id
+    };
+    assert_eq!(sel(&a), newest(&a));
+    a.add_packets(packet_fixture(100));
+    render(&mut a, 180, 46);
+    assert_eq!(sel(&a), newest(&a));
+    // Moving up pins the selection to that packet.
+    key(&mut a, KeyCode::Up);
+    let pinned = sel(&a);
+    a.add_packets(packet_fixture(200));
+    render(&mut a, 180, 46);
+    assert_eq!(sel(&a), pinned);
+    // End resumes following.
+    key(&mut a, KeyCode::End);
+    a.add_packets(packet_fixture(300));
+    render(&mut a, 180, 46);
+    assert_eq!(sel(&a), newest(&a));
+
+    // The filter searches the decoded info too.
+    a.filter = "clienthello".into();
+    assert_eq!(a.pkt_rows().len(), 4);
+    a.filter.clear();
+
+    // The truncated packet says so, and its bytes scroll.
+    a.pkt_sel = Some(7);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("first 345 B"), "{text}");
+    key(&mut a, KeyCode::Char(']'));
+    render(&mut a, 180, 46);
+    assert!(a.pkt_scroll > 0);
+
+    // c stops capturing the selected packet's program; x clears the list.
+    key(&mut a, KeyCode::Char('c'));
+    assert!(!a.capturing.contains("curl") && a.capture_dirty);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("stopped capturing curl"));
+    key(&mut a, KeyCode::Char('x'));
+    assert!(a.packets.is_empty());
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("waiting for packets from firefox"));
+}
+
+#[test]
+fn c_toggles_capture_on_processes() {
+    let mut a = app();
+    a.capturing.clear();
+    // firefox is the first row, sorted by rate in the fixture.
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(!text.contains("● firefox"));
+    let name = selected_name(&a);
+    key(&mut a, KeyCode::Char('c'));
+    assert!(a.capturing.contains(&name) && a.capture_dirty);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains(&format!("● {name}")), "{text}");
+    assert!(text.contains(&format!("capturing {name} · press 4")));
+    key(&mut a, KeyCode::Char('c'));
+    assert!(a.capturing.is_empty());
+
+    // Without eBPF the Packets tab explains why it's empty.
+    let mut a = app();
+    a.packets.clear();
+    a.snap.source = Source::TcpInfo {
+        reason: "eBPF needs root".into(),
+    };
+    key(&mut a, KeyCode::Char('4'));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("needs eBPF: run nitronet as root"));
+}
+
+#[test]
+fn packet_direction_and_content_filters() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    let shown = |a: &App| -> Vec<crate::packet::Packet> {
+        a.pkt_rows().iter().map(|&i| a.packets[i].clone()).collect()
+    };
+    key(&mut a, KeyCode::Char('i'));
+    assert!(shown(&a).iter().all(|p| p.outgoing));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(
+        text.contains("sent only") && text.contains("8 of 12 packets"),
+        "{text}"
+    );
+    key(&mut a, KeyCode::Char('i'));
+    assert!(shown(&a).iter().all(|p| !p.outgoing));
+    key(&mut a, KeyCode::Char('i'));
+    assert_eq!(shown(&a).len(), 12);
+
+    // with data: handshake and ack packets go.
+    key(&mut a, KeyCode::Char('e'));
+    assert!(shown(&a).iter().all(|p| p.content != Content::Empty));
+    assert_eq!(shown(&a).len(), 8);
+    // unencrypted: DNS, the ClientHello and the plain HTTP request.
+    key(&mut a, KeyCode::Char('e'));
+    let infos: Vec<String> = shown(&a)
+        .iter()
+        .map(|p| p.app_info().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        infos,
+        [
+            "DNS A? example.com",
+            "DNS A example.com → 93.184.215.14",
+            "TLS ClientHello → example.com",
+            "GET /status HTTP/1.1",
+        ]
+    );
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("unencrypted") && !text.contains("TLS data"));
+    assert!(
+        text.contains("plain · HTTP"),
+        "the selected packet's content label"
+    );
+    // Filters that hide everything say how to undo them.
+    key(&mut a, KeyCode::Char('i'));
+    key(&mut a, KeyCode::Char('i'));
+    a.filter = "zzz".into();
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("no packets match"));
+}
+
+#[test]
+fn filter_words_must_all_match_and_bang_excludes() {
+    let mut a = app();
+    a.filter = "example.com !dns".into();
+    assert_eq!(a.pkt_rows().len(), 1);
+    a.filter = "curl 443".into();
+    assert_eq!(a.pkt_rows().len(), 7);
+    a.filter = "curl !".into();
+    assert_eq!(a.pkt_rows().len(), 9);
+    // The same rules apply on every tab.
+    a.filter = "fire !fox".into();
+    assert!(a.proc_views().is_empty());
+    a.filter = "systemd !resolve".into();
+    assert!(
+        a.proc_views()
+            .iter()
+            .all(|v| !v.row.name.contains("resolve"))
+    );
+    assert!(!a.proc_views().is_empty());
+}
+
+#[test]
+fn conversations_group_packets_and_open() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    key(&mut a, KeyCode::Char('f'));
+    assert!(a.pkt_flows);
+    let flows = a.flows();
+    assert_eq!(flows.len(), 5);
+    let https = flows
+        .iter()
+        .position(|f| f.key.program == "curl" && f.key.proto == "TCP")
+        .unwrap();
+    assert_eq!(flows[https].packets(), 7);
+    assert_eq!((flows[https].sent, flows[https].received), (4, 3));
+    assert_eq!(flows[https].what(), "TLS ClientHello → example.com");
+    a.move_to(|_, _| https);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    for want in [
+        "5 conversations",
+        "READABLE IN IT",
+        "4 sent · 3 received",
+        "enter opens",
+    ] {
+        assert!(text.contains(want), "missing {want:?}");
+    }
+
+    // enter lists its packets from the first; esc goes back.
+    key(&mut a, KeyCode::Enter);
+    assert!(!a.pkt_flows && a.pkt_flow.is_some());
+    assert_eq!(a.pkt_rows().len(), 7);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("esc back") && text.contains("[S]"));
+    let first = a.pkt_rows()[a.pkt_state.selected().unwrap()];
+    assert_eq!(a.packets[first].head.as_ref().unwrap().info, "[S]");
+    key(&mut a, KeyCode::Esc);
+    assert!(a.pkt_flows && a.pkt_flow.is_none());
+    assert_eq!(a.flow_sel.as_ref().unwrap().program, "curl");
+
+    // s sorts conversations; the unencrypted filter applies to them too.
+    key(&mut a, KeyCode::Char('s'));
+    assert_eq!(a.flow_sort, super::FlowSort::Bytes);
+    key(&mut a, KeyCode::Char('e'));
+    key(&mut a, KeyCode::Char('e'));
+    assert_eq!(a.flows().len(), 3);
+}
+
+#[test]
+fn payload_shows_as_text() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    a.filter = "status".into();
+    render(&mut a, 180, 46);
+    key(&mut a, KeyCode::Char('t'));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(
+        text.contains("PAYLOAD") && text.contains("Host: nas"),
+        "{text}"
+    );
+    key(&mut a, KeyCode::Char('t'));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("BYTES"));
+}
+
+#[test]
+fn h_on_packets_explains_capture() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    key(&mut a, KeyCode::Char('e'));
+    key(&mut a, KeyCode::Char('H'));
+    let text = buffer_text(&render(&mut a, 180, 70));
+    for want in [
+        "how packet capture works",
+        "CAPTURE",
+        "is its socket on the list?",
+        "8 MB ring buffer",
+        "CONTENT",
+        "look random",
+        "GOING THROUGH THEM",
+        "now: with data",
+        "capturing curl, firefox · 12 packets kept",
+    ] {
+        assert!(text.contains(want), "missing {want:?}");
+    }
+    // Small terminals scroll to the end.
+    render(&mut a, 80, 24);
+    key(&mut a, KeyCode::End);
+    let text = buffer_text(&render(&mut a, 80, 24));
+    assert!(text.contains("writes no files"));
+    // Its boxes line up too.
+    for w in [60, 88] {
+        let mut width = None;
+        for l in &super::diagram::lines(&a, w) {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            if text.starts_with('╭') {
+                width = Some(l.width());
+            }
+            if text.starts_with('│') || text.starts_with('╰') {
+                assert_eq!(Some(l.width()), width, "misaligned: {text:?}");
+            }
+            // The full-size popup (92 columns) has 88 inside.
+            assert!(w < 88 || l.width() <= 88, "too wide: {text:?}");
         }
     }
 }

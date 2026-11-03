@@ -8,9 +8,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph};
 
-use super::App;
 use super::fmt::{ago, elide_end};
 use super::theme::{Theme, theme};
+use super::{App, ContentFilter, DirFilter, Tab};
 use crate::lan::Method;
 use crate::sampler::Source;
 
@@ -111,6 +111,9 @@ fn under_right(inner: usize, s: Span<'static>) -> Line<'static> {
 }
 
 pub fn lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    if app.tab == Tab::Packets {
+        return capture_lines(app, width);
+    }
     let t = theme();
     // Each box's inner width, from the room available.
     let inner = ((width as usize).saturating_sub(LINK + 6) / 2).clamp(24, 38);
@@ -287,6 +290,250 @@ pub fn lines(app: &App, width: u16) -> Vec<Line<'static>> {
     }
     out.push(Line::default());
 
+    // ---------------------------------------------------------------- packets
+    out.push(heading(
+        t,
+        "PACKETS",
+        "the Packets tab · only programs you press c on",
+    ));
+    out.push(Line::default());
+    let rows = vec![
+        row("socket on the capture list", Link::None, ""),
+        row("  or made by a captured program", Link::None, ""),
+        row(
+            "→ copy its first 2 KB",
+            Link::Right,
+            "1  match socket → program",
+        ),
+        row(
+            "  into a ring buffer",
+            Link::None,
+            "  same owners as Processes",
+        ),
+        row(
+            "other programs' packets",
+            Link::None,
+            "2  decode IP, TCP, UDP, ICMP",
+        ),
+        row(
+            "  pass by, never copied",
+            Link::None,
+            "  DNS name, TLS server name,",
+        ),
+        row("", Link::None, "  HTTP request line, QUIC"),
+        row("", Link::None, "3  keep the last 5000, in memory"),
+    ];
+    out.extend(boxes(
+        t,
+        inner,
+        "kernel · eBPF, every packet",
+        "nitronet",
+        &rows,
+    ));
+    out.push(under_right(
+        inner,
+        dim("most traffic is encrypted (TLS, QUIC):"),
+    ));
+    out.push(under_right(inner, dim("you see who and when, not what")));
+    out.push(under_right(
+        inner,
+        dim("(H on the Packets tab explains more)"),
+    ));
+    out.push(Line::default());
+    out.push(status(t, capture_status(app)));
+    out.push(Line::default());
+    limits(&mut out);
+    out
+}
+
+/// "now: capturing firefox · 120 packets", or why capture can't run.
+fn capture_status(app: &App) -> Vec<Span<'static>> {
+    let t = theme();
+    if !matches!(app.snap.source, Source::Ebpf { .. }) {
+        return vec![Span::styled(
+            "needs eBPF: run nitronet as root",
+            t.fg(t.warn),
+        )];
+    }
+    if app.capturing.is_empty() {
+        return vec![Span::styled(
+            "not capturing · press c on a program in Processes",
+            t.muted(),
+        )];
+    }
+    let names: Vec<&str> = app.capturing.iter().map(String::as_str).collect();
+    let mut v = vec![
+        Span::styled(format!("capturing {}", names.join(", ")), t.fg(t.good)),
+        Span::styled(
+            format!(" · {} packets kept", app.packets.len()),
+            t.fg(t.text),
+        ),
+    ];
+    if app.capture_dropped > 0 {
+        v.push(Span::styled(
+            format!(" · {} dropped", app.capture_dropped),
+            t.fg(t.warn),
+        ));
+    }
+    v
+}
+
+/// The H page on the Packets tab: how capture works in detail, how packets
+/// are labeled, and the keys for going through them.
+fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let t = theme();
+    let inner = ((width as usize).saturating_sub(LINK + 6) / 2).clamp(24, 38);
+    let mut out = vec![Line::default()];
+
+    out.push(heading(t, "CAPTURE", "what happens to each packet"));
+    out.push(Line::default());
+    let every = fmt_interval(app);
+    let rows = vec![
+        row("a packet is sent or arrives", Link::None, ""),
+        row("  for any program at all", Link::None, ""),
+        row("is its socket on the list?", Link::None, ""),
+        row(
+            format!("  updated every {every} from Sockets"),
+            Link::None,
+            "",
+        ),
+        row("or opened by a captured name?", Link::None, ""),
+        row("  catches new processes at once", Link::None, ""),
+        row(
+            "yes: copy its first 2 KB",
+            Link::Right,
+            "1  read the ring buffer",
+        ),
+        row(
+            "  into an 8 MB ring buffer",
+            Link::None,
+            "  a thread drains it often",
+        ),
+        row(
+            "no: untouched, never copied",
+            Link::None,
+            "2  socket → program",
+        ),
+        row("", Link::None, "3  decode IP, TCP, UDP, ICMP"),
+        row("", Link::None, "  DNS, TLS name, HTTP, QUIC"),
+        row("", Link::None, "4  label the content (below)"),
+        row("", Link::None, "5  keep the last 5000, in memory"),
+    ];
+    out.extend(boxes(t, inner, "kernel · eBPF", "nitronet", &rows));
+    out.push(Line::default());
+    out.push(status(t, capture_status(app)));
+    out.push(Line::default());
+
+    out.push(heading(
+        t,
+        "CONTENT",
+        "how each packet is labeled · e filters on this",
+    ));
+    out.push(Line::default());
+    let label = |name: &'static str, color, lines: &[&str]| -> Vec<Line<'static>> {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", if i == 0 { name } else { "" }),
+                        t.fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(l.to_string(), t.fg(t.text)),
+                ])
+            })
+            .collect()
+    };
+    out.extend(label(
+        "empty",
+        t.muted,
+        &["no payload: connection setup (SYN), acknowledgements, teardown (FIN)"],
+    ));
+    out.extend(label(
+        "plain",
+        t.good,
+        &[
+            "readable: DNS, HTTP, NTP, DHCP, an SSH greeting, a TLS ClientHello",
+            "(its server name travels in clear), or a payload that's mostly text",
+        ],
+    ));
+    out.extend(label(
+        "encrypted",
+        t.muted,
+        &[
+            "TLS records and QUIC; every later packet of a connection once it has",
+            "been seen encrypted; ports such as 443, 853, 993 and 22; or bytes that",
+            "look random (high entropy), which also catches compressed data",
+        ],
+    ));
+    out.extend(label(
+        "binary",
+        t.text,
+        &["anything else: not text and not random, e.g. a game's own protocol"],
+    ));
+    out.push(Line::from(Span::styled(
+        "These are guesses from the bytes. Nothing is decrypted.",
+        t.muted(),
+    )));
+    out.push(Line::default());
+
+    out.push(heading(t, "GOING THROUGH THEM", "keys on this tab"));
+    out.push(Line::default());
+    let key = |k: &str, what: &str, now: Option<String>| {
+        let mut v = vec![
+            Span::styled(
+                format!("{k:<5}"),
+                t.fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(what.to_string(), t.fg(t.text)),
+        ];
+        if let Some(n) = now {
+            v.push(Span::styled(format!("  now: {n}"), t.fg(t.good)));
+        }
+        Line::from(v)
+    };
+    let dir_now = (app.pkt_dir != DirFilter::Both).then(|| app.pkt_dir.label().to_string());
+    let content_now =
+        (app.pkt_content != ContentFilter::All).then(|| app.pkt_content.label().to_string());
+    out.push(key(
+        "i",
+        "sent and received → sent only → received only",
+        dir_now,
+    ));
+    out.push(key("e", "all → with data → unencrypted only", content_now));
+    out.push(key(
+        "f",
+        "conversations: one row per connection, with what was readable in it",
+        None,
+    ));
+    out.push(key(
+        "",
+        "enter lists a conversation's packets, esc goes back",
+        None,
+    ));
+    out.push(key(
+        "/",
+        "filter: every word must match, !word excludes (\"dns !mdns\")",
+        (!app.filter.is_empty()).then(|| format!("\"{}\"", app.filter)),
+    ));
+    out.push(key("t", "show the payload as text instead of hex", None));
+    out.push(key("[ ]", "scroll the payload", None));
+    out.push(key(
+        "r",
+        "newest first · x clears the list · space pauses",
+        None,
+    ));
+    out.push(key(
+        "c",
+        "stop capturing the selected packet's program",
+        None,
+    ));
+    out.push(Line::from(Span::styled(
+        "With the newest packet selected the list follows new ones, like tail -f.",
+        t.muted(),
+    )));
+    out.push(Line::default());
     limits(&mut out);
     out
 }
@@ -296,7 +543,8 @@ fn limits(out: &mut Vec<Line<'static>>) {
     out.push(heading(t, "WHAT IT DOESN'T DO", ""));
     out.push(Line::default());
     for line in [
-        "reads no packet contents: only counts, addresses and socket owners",
+        "reads no packet contents, except for programs you choose to capture (c),",
+        "  and those stay in memory: nothing is saved to disk",
         "sends packets only on your local network, and only once you open Devices",
         "the eBPF programs detach by themselves when nitronet exits, even if killed",
         "name lookups go through your system resolver, which may ask your router",
@@ -345,7 +593,14 @@ pub fn draw(app: &mut App, f: &mut Frame, area: Rect) {
         .border_style(t.fg(t.border_focus))
         .title(Line::from(vec![
             Span::raw(" "),
-            Span::styled("how nitronet works", t.title()),
+            Span::styled(
+                if app.tab == Tab::Packets {
+                    "how packet capture works"
+                } else {
+                    "how nitronet works"
+                },
+                t.title(),
+            ),
             Span::raw(" "),
         ]))
         .title_bottom(

@@ -1,6 +1,7 @@
 mod bpf;
 mod lan;
 mod netlink;
+mod packet;
 mod procfs;
 mod sampler;
 mod ui;

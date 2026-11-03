@@ -7,13 +7,17 @@
 //!   * tcp_info (fallback): the kernel's per-socket TCP payload counters, read
 //!     with the sock_diag dump. TCP only, and short-lived sockets are missed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Instant;
 
-use crate::bpf::{self, Entry, Tracker};
+use crate::bpf::{self, Capture, Entry, RawPacket, Tracker};
 use crate::netlink::{Diag, Proto, SockInfo};
+use crate::packet::{self, Classifier, Content, Packet};
 use crate::procfs::{self, ProcMap};
+
+/// Captured packets held for the UI (for example while it is paused).
+const PENDING: usize = 20_000;
 
 /// Who a socket belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -107,6 +111,13 @@ pub struct Sampler {
     nic_prev: Option<(u64, u64)>,
     nic_start: Option<(u64, u64)>,
     acc: HashMap<Owner, Acc>,
+    /// Packet capture, running while any program is chosen for it.
+    capture: Option<Capture>,
+    capture_names: HashSet<String>,
+    pending: Vec<Packet>,
+    pending_lost: u64,
+    next_packet: u64,
+    classifier: Classifier,
 }
 
 impl Sampler {
@@ -153,6 +164,12 @@ impl Sampler {
             nic_prev: None,
             nic_start: None,
             acc: HashMap::new(),
+            capture: None,
+            capture_names: HashSet::new(),
+            pending: Vec::new(),
+            pending_lost: 0,
+            next_packet: 0,
+            classifier: Classifier::default(),
         })
     }
 
@@ -168,6 +185,8 @@ impl Sampler {
     }
 
     pub fn sample(&mut self) -> io::Result<Snapshot> {
+        // Attribute captured packets while their sockets are still known.
+        self.drain_capture();
         let now = Instant::now();
         let socks = self.diag.dump_all()?;
         let pm = procfs::scan();
@@ -316,6 +335,7 @@ impl Sampler {
         self.seen = next_seen;
         self.nic_prev = nic;
         self.last = Some(now);
+        self.update_capture_targets();
 
         Ok(Snapshot {
             sockets: rows,
@@ -349,6 +369,132 @@ impl Sampler {
             Owner::Kernel
         } else {
             Owner::Uid(sock.uid)
+        }
+    }
+
+    /// Captures packets from the programs named (as in /proc/<pid>/comm), or
+    /// stops capturing when the set is empty. The error is ready to show.
+    pub fn set_capture(&mut self, names: &HashSet<String>) -> Result<(), String> {
+        if names.is_empty() {
+            self.drain_capture();
+            self.capture = None;
+            self.capture_names.clear();
+            return Ok(());
+        }
+        let Some(tracker) = &self.tracker else {
+            return Err(match &self.source {
+                Source::TcpInfo { reason } if reason == "eBPF needs root" => {
+                    "capturing packets needs eBPF: run nitronet as root".to_string()
+                }
+                Source::TcpInfo { reason } => format!(
+                    "capturing packets needs eBPF, which isn't running ({})",
+                    reason.lines().next().unwrap_or_default()
+                ),
+                Source::Ebpf { .. } => "eBPF isn't running".to_string(),
+            });
+        };
+        if self.capture.is_none() {
+            self.capture = Some(
+                tracker
+                    .capture()
+                    .map_err(|e| format!("can't start capture: {e}"))?,
+            );
+        }
+        self.capture_names = names.clone();
+        self.update_capture_targets();
+        Ok(())
+    }
+
+    /// Tells the capture programs which sockets belong to captured programs.
+    fn update_capture_targets(&mut self) {
+        let Some(cap) = &mut self.capture else {
+            return;
+        };
+        let cookies: HashSet<u64> = self
+            .seen
+            .iter()
+            .filter(|(_, o)| {
+                matches!(o, Owner::Pid(_))
+                    && self
+                        .acc
+                        .get(o)
+                        .is_some_and(|a| self.capture_names.contains(&a.name))
+            })
+            .map(|(c, _)| *c)
+            .collect();
+        cap.set_targets(&self.capture_names, &cookies);
+    }
+
+    /// Captured packets since the last call, oldest first.
+    pub fn take_packets(&mut self) -> Vec<Packet> {
+        self.drain_capture();
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Packets matched but not kept because a buffer was full.
+    pub fn capture_dropped(&self) -> u64 {
+        self.capture.as_ref().map_or(0, |c| c.dropped()) + self.pending_lost
+    }
+
+    fn drain_capture(&mut self) {
+        let Some(cap) = &self.capture else {
+            return;
+        };
+        let raw = cap.take();
+        if raw.is_empty() {
+            return;
+        }
+        let mut cache: HashMap<u64, (Owner, String)> = HashMap::new();
+        for r in raw {
+            let (owner, program) = cache
+                .entry(r.cookie)
+                .or_insert_with(|| self.packet_owner(r.cookie))
+                .clone();
+            let RawPacket {
+                at,
+                len,
+                outgoing,
+                data,
+                ..
+            } = r;
+            let mut p = Packet {
+                id: self.next_packet,
+                at,
+                owner,
+                program,
+                outgoing,
+                len,
+                head: packet::decode(&data, len),
+                data,
+                content: Content::Empty,
+            };
+            self.classifier.apply(&mut p);
+            self.pending.push(p);
+            self.next_packet += 1;
+        }
+        if self.pending.len() > PENDING {
+            let extra = self.pending.len() - PENDING;
+            self.pending.drain(..extra);
+            self.pending_lost += extra as u64;
+        }
+    }
+
+    /// Who a captured packet's socket belongs to: the owner from the last
+    /// sample, or else the process eBPF saw create it.
+    fn packet_owner(&self, cookie: u64) -> (Owner, String) {
+        if let Some(o) = self.seen.get(&cookie)
+            && let Some(a) = self.acc.get(o)
+        {
+            return (*o, a.name.clone());
+        }
+        match self.tracker.as_ref().and_then(|t| t.lookup(cookie)) {
+            Some(e) if e.pid != 0 => {
+                let name = procfs::read_process(e.pid)
+                    .map(|p| p.name)
+                    .unwrap_or(e.comm);
+                (Owner::Pid(e.pid), name)
+            }
+            _ => (Owner::Kernel, "?".into()),
         }
     }
 
@@ -458,5 +604,61 @@ mod tests {
         assert_eq!(delta((100, 50), None, true), (100, 50));
         assert_eq!(delta((100, 50), None, false), (0, 0));
         assert_eq!(delta((10, 50), Some((40, 20)), true), (10, 30)); // reset counter
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Needs root and network: sudo -E cargo test live_curl -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_curl_capture() {
+        let mut s = Sampler::new(true).unwrap();
+        s.sample().unwrap();
+        s.set_capture(&HashSet::from(["curl".to_string()])).unwrap();
+        // Unrelated traffic from this process must not show up.
+        let _ = std::net::TcpStream::connect("1.1.1.1:80");
+        let out = std::process::Command::new("curl")
+            .args([
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://example.com/",
+            ])
+            .output()
+            .unwrap();
+        eprintln!("curl: {}", String::from_utf8_lossy(&out.stdout));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.sample().unwrap();
+        let pk = s.take_packets();
+        for p in &pk {
+            let d = p.head.as_ref().unwrap();
+            let (l, r) = p.ends().unwrap();
+            eprintln!(
+                "{} {} {:>5} {} {} {} {} [{}]",
+                p.program,
+                if p.outgoing { "→" } else { "←" },
+                p.len,
+                d.proto(),
+                l,
+                r,
+                d.info,
+                p.content.label()
+            );
+        }
+        eprintln!("{} packets, {} dropped", pk.len(), s.capture_dropped());
+        assert!(pk.iter().all(|p| p.program == "curl"));
+        assert!(pk.iter().any(|p| {
+            p.head
+                .as_ref()
+                .unwrap()
+                .info
+                .contains("ClientHello → example.com")
+        }));
+        s.set_capture(&HashSet::new()).unwrap();
     }
 }

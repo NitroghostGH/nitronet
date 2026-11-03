@@ -47,8 +47,14 @@ pub fn draw(app: &mut App, f: &mut Frame) {
     let views = app.proc_views();
     let socks = app.sock_rows();
     let devs = app.dev_rows();
-    app.sync_selection(&views, &socks, &devs);
-    let tabs = tab_title(app, body, [views.len(), socks.len(), devs.len()]);
+    let pkts = app.pkt_rows();
+    let flows = app.flows();
+    app.sync_selection(&views, &socks, &devs, &pkts, &flows);
+    let tabs = tab_title(
+        app,
+        body,
+        [views.len(), socks.len(), devs.len(), pkts.len()],
+    );
 
     match app.tab {
         Tab::Procs => {
@@ -80,6 +86,7 @@ pub fn draw(app: &mut App, f: &mut Frame) {
                 draw_device_detail(app, f, detail, devs[sel]);
             }
         }
+        Tab::Packets => super::packets_view::draw(app, f, body, &pkts, &flows, tabs),
     }
 
     draw_footer(app, f, footer);
@@ -321,17 +328,18 @@ fn draw_header_compact(app: &App, f: &mut Frame, area: Rect) {
 
 /// The view switcher, drawn into the table panel's top border. The active
 /// view is a filled pill. Click regions are recorded for the mouse.
-fn tab_title(app: &mut App, panel: Rect, counts: [usize; 3]) -> Line<'static> {
+fn tab_title(app: &mut App, panel: Rect, counts: [usize; 4]) -> Line<'static> {
     let t = theme();
     app.hit.tabs.clear();
     // Block titles start one cell in from the corner.
     let mut x = panel.x + 1;
     let mut spans = Vec::new();
-    let [n_procs, n_socks, n_devs] = counts;
+    let [n_procs, n_socks, n_devs, n_pkts] = counts;
     for (tab, name, n) in [
         (Tab::Procs, "Processes", n_procs),
         (Tab::Sockets, "Sockets", n_socks),
         (Tab::Devices, "Devices", n_devs),
+        (Tab::Packets, "Packets", n_pkts),
     ] {
         let active = app.tab == tab;
         let label = format!(" {name} {n} ");
@@ -351,7 +359,7 @@ fn tab_title(app: &mut App, panel: Rect, counts: [usize; 3]) -> Line<'static> {
 }
 
 /// The filter, drawn into the table panel's bottom border.
-fn filter_line(app: &App) -> Line<'static> {
+pub(super) fn filter_line(app: &App) -> Line<'static> {
     let t = theme();
     if app.editing_filter {
         Line::from(vec![
@@ -373,7 +381,7 @@ fn filter_line(app: &App) -> Line<'static> {
 
 // ------------------------------------------------------------------ tables
 
-fn panel() -> Block<'static> {
+pub(super) fn panel() -> Block<'static> {
     let t = theme();
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -387,7 +395,7 @@ fn sort_arrow(desc: bool) -> &'static str {
 /// Draws a responsive table into a bordered panel: columns that don't fit are
 /// dropped by priority, and there's a scrollbar and an empty-state message.
 #[allow(clippy::too_many_arguments)]
-fn draw_table(
+pub(super) fn draw_table(
     app: &mut App,
     f: &mut Frame,
     area: Rect,
@@ -432,6 +440,8 @@ fn draw_table(
         Tab::Procs => &mut app.proc_state,
         Tab::Sockets => &mut app.sock_state,
         Tab::Devices => &mut app.dev_state,
+        Tab::Packets if app.pkt_flows => &mut app.flow_state,
+        Tab::Packets => &mut app.pkt_state,
     };
     clamp(state, len);
     let table = Table::new(rows, widths)
@@ -486,7 +496,7 @@ fn clamp(state: &mut TableState, len: usize) {
     });
 }
 
-fn empty_message(app: &App, what: &str) -> String {
+pub(super) fn empty_message(app: &App, what: &str) -> String {
     if app.filter.is_empty() {
         format!("no {what}")
     } else {
@@ -514,7 +524,14 @@ fn draw_procs(app: &mut App, f: &mut Frame, area: Rect, views: &[ProcView], tabs
         .iter()
         .map(|v| v.row.rate_in + v.row.rate_out)
         .fold(0.0, f64::max);
-    let rows = views.iter().map(|v| proc_cells(t, v, max_rate)).collect();
+    let rows = views
+        .iter()
+        .map(|v| {
+            let captured =
+                matches!(v.row.owner, Owner::Pid(_)) && app.capturing.contains(&v.row.name);
+            proc_cells(t, v, max_rate, captured)
+        })
+        .collect();
     let (sorted_col, desc) = match app.proc_sort {
         ProcSort::Rate => (4, true),
         ProcSort::Total => (7, true),
@@ -553,7 +570,7 @@ fn draw_procs(app: &mut App, f: &mut Frame, area: Rect, views: &[ProcView], tabs
     );
 }
 
-fn proc_cells(t: &Theme, v: &ProcView, max_rate: f64) -> Vec<Cell<'static>> {
+fn proc_cells(t: &Theme, v: &ProcView, max_rate: f64, captured: bool) -> Vec<Cell<'static>> {
     let r = &v.row;
     let pseudo = !matches!(r.owner, Owner::Pid(_));
     let pid = match (r.owner, v.owners.len()) {
@@ -571,6 +588,9 @@ fn proc_cells(t: &Theme, v: &ProcView, max_rate: f64) -> Vec<Cell<'static>> {
             t.muted()
         },
     )];
+    if captured {
+        name.insert(0, Span::styled("● ", t.fg(t.warn)));
+    }
     if !r.alive {
         name.push(Span::styled(
             "  exited",
@@ -781,7 +801,7 @@ fn sock_cells(
 
 /// An address with the host muted and the port bright, since the port is
 /// usually what you're scanning for.
-fn addr_line(a: SocketAddr, width: usize) -> Line<'static> {
+pub(super) fn addr_line(a: SocketAddr, width: usize) -> Line<'static> {
     let t = theme();
     let s = elide_middle(&fmt_addr(a), width);
     if s == "*" {
@@ -873,6 +893,21 @@ fn draw_detail(app: &App, f: &mut Frame, area: Rect, v: &ProcView) {
         l.extend(ports_line(&r.listening, stats.width.saturating_sub(10) as usize).spans);
         lines.push(Line::from(l));
     }
+    if matches!(r.owner, Owner::Pid(_)) {
+        lines.push(Line::default());
+        lines.push(if app.capturing.contains(&r.name) {
+            let n = app.packets.iter().filter(|p| p.program == r.name).count();
+            kv(
+                "capture",
+                vec![
+                    Span::styled("● ", t.fg(t.warn)),
+                    Span::styled(format!("{n} packets"), t.fg(t.text)),
+                ],
+            )
+        } else {
+            kv("capture", vec![Span::styled("off · c starts", t.faint())])
+        });
+    }
     f.render_widget(Paragraph::new(lines), stats);
 
     // Graph
@@ -955,15 +990,29 @@ fn draw_detail(app: &App, f: &mut Frame, area: Rect, v: &ProcView) {
 
 fn draw_footer(app: &App, f: &mut Frame, area: Rect) {
     let t = theme();
-    let mut hints: Vec<(&str, &str)> = vec![
-        ("q", "quit"),
-        ("?", "help"),
-        ("/", "filter"),
-        ("tab", "switch"),
-        ("s", "sort"),
-    ];
+    if let Some(msg) = app.flash_text() {
+        let line = Line::from(vec![
+            Span::styled(" ▸ ", t.fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(msg.to_string(), t.fg(t.text)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    let mut hints: Vec<(&str, &str)> = if app.tab == Tab::Packets {
+        // There are many keys here, so the packet ones go first.
+        super::packets_view::hints(app)
+    } else {
+        vec![
+            ("q", "quit"),
+            ("?", "help"),
+            ("/", "filter"),
+            ("tab", "switch"),
+            ("s", "sort"),
+        ]
+    };
     match app.tab {
         Tab::Procs => {
+            hints.push(("c", "capture packets"));
             hints.push((
                 "g",
                 if app.group_by_program {
@@ -1001,9 +1050,12 @@ fn draw_footer(app: &App, f: &mut Frame, area: Rect) {
                 },
             ));
         }
+        Tab::Packets => {}
     }
-    hints.push(("space", if app.paused { "resume" } else { "pause" }));
-    hints.push(("H", "how it works"));
+    if app.tab != Tab::Packets {
+        hints.push(("space", if app.paused { "resume" } else { "pause" }));
+        hints.push(("H", "how it works"));
+    }
 
     let mut spans = vec![Span::raw(" ")];
     let mut used = 1;
@@ -1024,21 +1076,21 @@ fn draw_footer(app: &App, f: &mut Frame, area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let t = theme();
-    let sections: [(&str, &[(&str, &str)]); 4] = [
+    let sections: [(&str, &[(&str, &str)]); 5] = [
         (
             "navigate",
             &[
                 ("↑ ↓  j k", "move selection"),
                 ("PgUp PgDn", "move by a page"),
                 ("Home End", "first / last row"),
-                ("tab ← →  1-3", "switch view"),
+                ("tab ← →  1-4", "switch view"),
                 ("mouse", "click rows and tabs, wheel scrolls"),
             ],
         ),
         (
             "view",
             &[
-                ("/", "filter by name, port, user, address"),
+                ("/", "filter: words must all match, !word excludes"),
                 ("s  r", "cycle sort · reverse it"),
                 ("g", "group processes by program"),
                 ("l", "only listening sockets"),
@@ -1050,6 +1102,18 @@ fn draw_help(f: &mut Frame, area: Rect) {
             &[
                 ("p", "check the device's common ports"),
                 ("R  F5", "rescan the network now"),
+            ],
+        ),
+        (
+            "packets",
+            &[
+                ("c", "capture the selected program (root)"),
+                ("i", "sent · received · both"),
+                ("e", "all · with data · unencrypted"),
+                ("f", "conversations; enter opens one"),
+                ("t", "payload as text or hex"),
+                ("[  ]", "scroll the payload"),
+                ("x", "clear the captured list"),
             ],
         ),
         (
@@ -1097,7 +1161,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 
     let h = (lines.len() as u16 + 2).min(area.height);
     let popup = area.centered(
-        Constraint::Length(56.min(area.width)),
+        Constraint::Length(64.min(area.width)),
         Constraint::Length(h),
     );
     f.render_widget(Clear, popup);

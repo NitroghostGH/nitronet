@@ -3,6 +3,8 @@
 
 mod diagram;
 mod fmt;
+mod packets;
+mod packets_view;
 mod theme;
 mod view;
 mod widgets;
@@ -10,7 +12,7 @@ mod widgets;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io;
 use std::time::{Duration, Instant};
 
@@ -26,11 +28,17 @@ use ratatui::widgets::TableState;
 pub use fmt::{fmt_addr, human};
 
 use crate::lan::{DevKey, Lan, LanState};
+use crate::packet::{FlowKey, Packet};
 use crate::sampler::{Owner, ProcRow, Sampler, Snapshot, SockRow};
+pub(crate) use packets::{ContentFilter, DirFilter, Flow, FlowSort};
 
 /// Samples kept for graphs. That's enough to fill a 300-column-wide graph at
 /// two samples per cell.
 const HISTORY: usize = 600;
+/// Captured packets kept for the Packets tab; older ones scroll away.
+const MAX_PACKETS: usize = 5000;
+/// How long a status message stays in the footer.
+const FLASH: Duration = Duration::from_secs(4);
 
 pub fn run(
     terminal: &mut DefaultTerminal,
@@ -46,13 +54,37 @@ pub fn run(
         if let Some(lan) = &app.lan {
             app.lan_state = lan.snapshot();
         }
+        if app.capture_dirty {
+            app.capture_dirty = false;
+            let names: HashSet<String> = app.capturing.iter().cloned().collect();
+            if let Err(e) = sampler.set_capture(&names) {
+                app.capturing.clear();
+                app.flash(e);
+            }
+        }
+        // While paused, packets wait in the sampler and appear on resume.
+        if !app.capturing.is_empty() && !app.paused {
+            let packets = sampler.take_packets();
+            app.add_packets(packets);
+            app.capture_dropped = sampler.capture_dropped();
+        }
         terminal.draw(|f| view::draw(&mut app, f))?;
         let mut timeout = next.saturating_duration_since(Instant::now());
-        // Redraw often while a scan or port probe runs, so progress is live.
+        // Redraw often while a scan or port probe runs, so progress is live,
+        // and while capturing, so packets appear as they arrive.
         let busy =
             app.lan_state.scanning.is_some() || app.lan_state.devices.values().any(|d| d.probing);
         if busy {
             timeout = timeout.min(Duration::from_millis(150));
+        } else if !app.capturing.is_empty() {
+            timeout = timeout.min(Duration::from_millis(250));
+        }
+        if let Some((_, at)) = &app.flash {
+            timeout = timeout.min(
+                FLASH
+                    .saturating_sub(at.elapsed())
+                    .max(Duration::from_millis(50)),
+            );
         }
         if event::poll(timeout)? {
             let quit = match event::read()? {
@@ -105,6 +137,7 @@ pub(crate) enum Tab {
     Procs,
     Sockets,
     Devices,
+    Packets,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -266,6 +299,33 @@ pub(crate) struct App {
     /// The LAN scanner (None in tests) and its latest state.
     pub lan: Option<Lan>,
     pub lan_state: LanState,
+    /// Captured packets, oldest first.
+    pub packets: VecDeque<Packet>,
+    pub pkt_state: TableState,
+    /// The selected packet's id. None follows the newest packet, like `tail -f`.
+    pub pkt_sel: Option<u64>,
+    /// The packet the highlight is on, and how far its hex dump is scrolled.
+    pub pkt_cur: Option<u64>,
+    pub pkt_scroll: usize,
+    /// `i`, `e`: which packets to show.
+    pub pkt_dir: DirFilter,
+    pub pkt_content: ContentFilter,
+    /// `f`: show conversations instead of packets.
+    pub pkt_flows: bool,
+    /// The conversation opened with enter: only its packets are listed.
+    pub pkt_flow: Option<FlowKey>,
+    /// `t`: show the payload as text rather than hex.
+    pub pkt_text: bool,
+    pub flow_state: TableState,
+    pub flow_sel: Option<FlowKey>,
+    pub flow_sort: FlowSort,
+    /// Programs (by name) whose packets are captured.
+    pub capturing: BTreeSet<String>,
+    /// Set when `capturing` changed and the sampler needs telling.
+    pub capture_dirty: bool,
+    pub capture_dropped: u64,
+    /// A short status message for the footer, and when it was set.
+    pub flash: Option<(String, Instant)>,
     pub history: History,
     pub hit: HitMap,
 }
@@ -297,6 +357,23 @@ impl App {
             dev_sort: DevSort::Ip,
             lan: None,
             lan_state: LanState::default(),
+            packets: VecDeque::new(),
+            pkt_state: TableState::default(),
+            pkt_sel: None,
+            pkt_cur: None,
+            pkt_scroll: 0,
+            pkt_dir: DirFilter::Both,
+            pkt_content: ContentFilter::All,
+            pkt_flows: false,
+            pkt_flow: None,
+            pkt_text: false,
+            flow_state: TableState::default(),
+            flow_sel: None,
+            flow_sort: FlowSort::Recent,
+            capturing: BTreeSet::new(),
+            capture_dirty: false,
+            capture_dropped: 0,
+            flash: None,
             history: History::default(),
             hit: HitMap::default(),
         };
@@ -314,7 +391,40 @@ impl App {
             Tab::Procs => &mut self.proc_state,
             Tab::Sockets => &mut self.sock_state,
             Tab::Devices => &mut self.dev_state,
+            Tab::Packets if self.pkt_flows => &mut self.flow_state,
+            Tab::Packets => &mut self.pkt_state,
         }
+    }
+
+    pub fn flash(&mut self, msg: impl Into<String>) {
+        self.flash = Some((msg.into(), Instant::now()));
+    }
+
+    /// The footer message, if it's recent.
+    pub fn flash_text(&self) -> Option<&str> {
+        self.flash
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < FLASH)
+            .map(|(m, _)| m.as_str())
+    }
+
+    pub fn add_packets(&mut self, packets: Vec<Packet>) {
+        self.packets.extend(packets);
+        if self.packets.len() > MAX_PACKETS {
+            let extra = self.packets.len() - MAX_PACKETS;
+            self.packets.drain(..extra);
+        }
+    }
+
+    /// Starts or stops capturing a program's packets.
+    fn toggle_capture(&mut self, name: String) {
+        if self.capturing.remove(&name) {
+            self.flash(format!("stopped capturing {name}"));
+        } else {
+            self.flash(format!("capturing {name} · press 4 to watch its packets"));
+            self.capturing.insert(name);
+        }
+        self.capture_dirty = true;
     }
 
     /// Switches view. The first visit to Devices starts the LAN scanner, so
@@ -338,7 +448,30 @@ impl App {
     /// If the item is gone (the process exited or the socket closed), the
     /// highlight stays on the same row and takes whatever item is there.
     /// This runs before every draw and every move.
-    pub fn sync_selection(&mut self, views: &[ProcView], socks: &[usize], devs: &[DevKey]) {
+    pub fn sync_selection(
+        &mut self,
+        views: &[ProcView],
+        socks: &[usize],
+        devs: &[DevKey],
+        pkts: &[usize],
+        flows: &[Flow],
+    ) {
+        let row = self
+            .flow_sel
+            .as_ref()
+            .and_then(|k| flows.iter().position(|f| f.key == *k));
+        let row = row.unwrap_or_else(|| self.flow_state.selected().unwrap_or(0));
+        self.select_flow(flows, row);
+
+        let row = match self.pkt_sel {
+            None => self.newest_row(pkts),
+            Some(id) => pkts
+                .iter()
+                .position(|&i| self.packets[i].id == id)
+                .unwrap_or_else(|| self.pkt_state.selected().unwrap_or(0)),
+        };
+        self.select_pkt(pkts, row);
+
         let row = self
             .dev_sel
             .and_then(|ip| devs.iter().position(|d| *d == ip));
@@ -382,6 +515,62 @@ impl App {
         self.sock_sel = Some(self.snap.sockets[socks[row]].sock.cookie);
     }
 
+    /// The row of the newest packet: the last, or the first when reversed.
+    fn newest_row(&self, pkts: &[usize]) -> usize {
+        if self.reverse {
+            0
+        } else {
+            pkts.len().saturating_sub(1)
+        }
+    }
+
+    fn select_pkt(&mut self, pkts: &[usize], row: usize) {
+        if pkts.is_empty() {
+            self.pkt_state.select(None);
+            return;
+        }
+        let row = row.min(pkts.len() - 1);
+        self.pkt_state.select(Some(row));
+        let id = self.packets[pkts[row]].id;
+        if self.pkt_cur != Some(id) {
+            self.pkt_cur = Some(id);
+            self.pkt_scroll = 0;
+        }
+        // On the newest row, keep following new packets.
+        self.pkt_sel = (row != self.newest_row(pkts)).then_some(id);
+    }
+
+    fn select_flow(&mut self, flows: &[Flow], row: usize) {
+        if flows.is_empty() {
+            self.flow_state.select(None);
+            return;
+        }
+        let row = row.min(flows.len() - 1);
+        self.flow_state.select(Some(row));
+        self.flow_sel = Some(flows[row].key.clone());
+    }
+
+    /// Enter on a conversation: list just its packets, from its first one.
+    fn open_flow(&mut self) {
+        let Some(key) = self.flow_sel.clone() else {
+            return;
+        };
+        let first = self
+            .packets
+            .iter()
+            .find(|p| p.flow().as_ref() == Some(&key))
+            .map(|p| p.id);
+        self.pkt_flow = Some(key);
+        self.pkt_flows = false;
+        self.pkt_sel = first;
+    }
+
+    /// Back from a conversation's packets to the list of conversations.
+    fn close_flow(&mut self) {
+        self.pkt_flow = None;
+        self.pkt_flows = true;
+    }
+
     fn select_dev(&mut self, devs: &[DevKey], row: usize) {
         if devs.is_empty() {
             self.dev_state.select(None);
@@ -397,7 +586,9 @@ impl App {
         let views = self.proc_views();
         let socks = self.sock_rows();
         let devs = self.dev_rows();
-        self.sync_selection(&views, &socks, &devs);
+        let pkts = self.pkt_rows();
+        let flows = self.flows();
+        self.sync_selection(&views, &socks, &devs, &pkts, &flows);
         match self.tab {
             Tab::Procs => {
                 let row = to(self.proc_state.selected().unwrap_or(0), views.len());
@@ -410,6 +601,14 @@ impl App {
             Tab::Devices => {
                 let row = to(self.dev_state.selected().unwrap_or(0), devs.len());
                 self.select_dev(&devs, row);
+            }
+            Tab::Packets if self.pkt_flows => {
+                let row = to(self.flow_state.selected().unwrap_or(0), flows.len());
+                self.select_flow(&flows, row);
+            }
+            Tab::Packets => {
+                let row = to(self.pkt_state.selected().unwrap_or(0), pkts.len());
+                self.select_pkt(&pkts, row);
             }
         }
     }
@@ -471,7 +670,9 @@ impl App {
         match k.code {
             KeyCode::Char('q') => return true,
             KeyCode::Esc => {
-                if self.filter.is_empty() {
+                if self.tab == Tab::Packets && self.pkt_flow.is_some() {
+                    self.close_flow();
+                } else if self.filter.is_empty() {
                     return true;
                 } else {
                     self.filter.clear();
@@ -486,16 +687,47 @@ impl App {
             KeyCode::Tab | KeyCode::Right => self.set_tab(match self.tab {
                 Tab::Procs => Tab::Sockets,
                 Tab::Sockets => Tab::Devices,
-                Tab::Devices => Tab::Procs,
+                Tab::Devices => Tab::Packets,
+                Tab::Packets => Tab::Procs,
             }),
             KeyCode::BackTab | KeyCode::Left => self.set_tab(match self.tab {
-                Tab::Procs => Tab::Devices,
+                Tab::Procs => Tab::Packets,
                 Tab::Sockets => Tab::Procs,
                 Tab::Devices => Tab::Sockets,
+                Tab::Packets => Tab::Devices,
             }),
             KeyCode::Char('1') => self.set_tab(Tab::Procs),
             KeyCode::Char('2') => self.set_tab(Tab::Sockets),
             KeyCode::Char('3') => self.set_tab(Tab::Devices),
+            KeyCode::Char('4') => self.set_tab(Tab::Packets),
+            KeyCode::Char('c') => self.capture_key(),
+            KeyCode::Char('x') if self.tab == Tab::Packets => {
+                self.packets.clear();
+                self.pkt_sel = None;
+                self.pkt_flow = None;
+            }
+            KeyCode::Char('i') if self.tab == Tab::Packets => self.pkt_dir = self.pkt_dir.next(),
+            KeyCode::Char('e') if self.tab == Tab::Packets => {
+                self.pkt_content = self.pkt_content.next()
+            }
+            KeyCode::Char('f') if self.tab == Tab::Packets => {
+                if self.pkt_flow.is_some() {
+                    self.close_flow();
+                } else {
+                    self.pkt_flows = !self.pkt_flows;
+                }
+            }
+            KeyCode::Char('t') if self.tab == Tab::Packets => {
+                self.pkt_text = !self.pkt_text;
+                self.pkt_scroll = 0;
+            }
+            KeyCode::Enter if self.tab == Tab::Packets && self.pkt_flows => self.open_flow(),
+            KeyCode::Char(']') if self.tab == Tab::Packets => {
+                self.pkt_scroll = self.pkt_scroll.saturating_add(4)
+            }
+            KeyCode::Char('[') if self.tab == Tab::Packets => {
+                self.pkt_scroll = self.pkt_scroll.saturating_sub(4)
+            }
             KeyCode::Char('R') | KeyCode::F(5) => self.rescan(),
             KeyCode::Char('p') if self.tab == Tab::Devices => {
                 if let (Some(lan), Some(key)) = (&self.lan, self.dev_sel) {
@@ -522,8 +754,61 @@ impl App {
         false
     }
 
+    /// `c`: on Processes, start or stop capturing the selected program; on
+    /// Packets, stop capturing the selected packet's program.
+    fn capture_key(&mut self) {
+        let name = match self.tab {
+            Tab::Procs => {
+                let views = self.proc_views();
+                let row = self.proc_state.selected();
+                match row.and_then(|r| views.get(r)) {
+                    Some(v) if matches!(v.row.owner, Owner::Pid(_)) => Some(v.row.name.clone()),
+                    Some(_) => {
+                        self.flash("only programs can be captured, not kernel or unresolved rows");
+                        None
+                    }
+                    None => None,
+                }
+            }
+            Tab::Packets => {
+                let program = if self.pkt_flows {
+                    self.flow_sel.as_ref().map(|k| k.program.clone())
+                } else {
+                    let pkts = self.pkt_rows();
+                    let row = self.pkt_state.selected();
+                    row.and_then(|r| pkts.get(r))
+                        .map(|&i| self.packets[i].program.clone())
+                };
+                match program {
+                    Some(name) if self.capturing.contains(&name) => Some(name),
+                    _ if self.capturing.is_empty() => {
+                        self.flash("select a program in Processes (1) and press c to capture it");
+                        None
+                    }
+                    _ => None,
+                }
+            }
+            _ => {
+                self.flash("press c on a program in Processes (1) to capture its packets");
+                None
+            }
+        };
+        if let Some(n) = name {
+            self.toggle_capture(n);
+        }
+    }
+
     fn cycle_sort(&mut self) {
-        self.reverse = false;
+        match self.tab {
+            Tab::Packets if self.pkt_flows => {
+                self.reverse = false;
+                self.flow_sort = self.flow_sort.next();
+                return;
+            }
+            // Packets are always in time order (r reverses).
+            Tab::Packets => return,
+            _ => self.reverse = false,
+        }
         match self.tab {
             Tab::Procs => {
                 self.proc_sort = match self.proc_sort {
@@ -549,6 +834,7 @@ impl App {
                     DevSort::Seen => DevSort::Ip,
                 }
             }
+            Tab::Packets => {}
         }
     }
 
@@ -694,12 +980,22 @@ impl App {
         keys
     }
 
+    /// The filter: every word must appear in some field, and a word starting
+    /// with `!` must appear in none ("dns !mdns", "firefox 443").
     pub fn matches(&self, fields: &[&str]) -> bool {
-        if self.filter.is_empty() {
+        if self.filter.trim().is_empty() {
             return true;
         }
-        let needle = self.filter.to_lowercase();
-        fields.iter().any(|f| f.to_lowercase().contains(&needle))
+        let fields: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
+        let hit = |w: &str| fields.iter().any(|f| f.contains(w));
+        self.filter
+            .to_lowercase()
+            .split_whitespace()
+            .all(|w| match w.strip_prefix('!') {
+                Some("") => true,
+                Some(not) => !hit(not),
+                None => hit(w),
+            })
     }
 
     /// The process rows to show: grouped, filtered and sorted.
