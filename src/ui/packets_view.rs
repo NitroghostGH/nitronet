@@ -11,8 +11,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph};
 
 use super::fmt::{elide_end, elide_middle, human};
+use super::sockets_view::addr_line;
 use super::theme::{Theme, theme};
-use super::view::{addr_line, draw_table, empty_message, filter_line, panel, table_window};
+use super::view::{draw_table, empty_message, filter_line, panel, table_window};
 use super::widgets::{Col, col};
 use super::{App, ContentFilter, DirFilter, Flow, FlowSort};
 use crate::packet::{self, Content, Endpoint, L4, Packet};

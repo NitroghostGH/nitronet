@@ -1101,10 +1101,10 @@ fn live_devices_snapshot() {
 #[test]
 fn ipv6_tail_fits_by_group() {
     assert_eq!(
-        super::view::v6_tail("…:9c1:5e2d:aa10:7b3c", 15),
+        super::devices_view::v6_tail("…:9c1:5e2d:aa10:7b3c", 15),
         "…:aa10:7b3c"
     );
-    assert_eq!(super::view::v6_tail("fe80::1", 15), "fe80::1");
+    assert_eq!(super::devices_view::v6_tail("fe80::1", 15), "fe80::1");
 }
 
 #[test]
@@ -1611,7 +1611,7 @@ fn r_reverses_only_the_list_on_screen() {
 
 #[test]
 fn history_aligns_owners_and_forgets_silent_ones() {
-    use super::{HISTORY, History};
+    use super::history::{HISTORY, History};
     let mut h = History::default();
     let mut snap = fixture(0);
     snap.nic_rate = Some((10.0, 1.0));
