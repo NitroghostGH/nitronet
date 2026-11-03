@@ -366,6 +366,8 @@ fn renders_everywhere() {
         render(&mut a, w, h);
         key(&mut a, KeyCode::Char('l'));
         render(&mut a, w, h);
+        key(&mut a, KeyCode::Char('s'));
+        render(&mut a, w, h);
         key(&mut a, KeyCode::Char('?'));
         render(&mut a, w, h);
     }
@@ -542,4 +544,98 @@ fn renders_live_data() {
         let text = buffer_text(&render(&mut a, 160, 45));
         assert!(text.contains("Processes") && text.contains("Sockets"));
     }
+}
+
+fn selected_name(a: &App) -> String {
+    let views = a.proc_views();
+    views[a.proc_state.selected().unwrap()].row.name.clone()
+}
+
+/// The highlight follows the selected process as changing rates re-sort the
+/// list, rather than staying on a row number while items slide underneath it.
+#[test]
+fn selection_follows_item_when_rates_reorder() {
+    let mut a = app();
+    render(&mut a, 160, 45);
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Down);
+    let picked = selected_name(&a);
+    let start_row = a.proc_state.selected();
+    let mut moved = 0;
+    for k in 300..420 {
+        a.set_snapshot(fixture(k));
+        render(&mut a, 160, 45);
+        assert_eq!(selected_name(&a), picked, "selection drifted at step {k}");
+        moved += usize::from(a.proc_state.selected() != start_row);
+    }
+    assert!(
+        moved > 0,
+        "the fixture never re-sorted {picked}, so this test proves nothing"
+    );
+
+    // Moving from there continues from the item's current row.
+    let row = a.proc_state.selected().unwrap();
+    key(&mut a, KeyCode::Down);
+    assert_eq!(a.proc_state.selected(), Some(row + 1));
+}
+
+#[test]
+fn socket_selection_follows_cookie() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('2'));
+    render(&mut a, 160, 45);
+    key(&mut a, KeyCode::Down);
+    let cookie = a.sock_sel.unwrap();
+    let mut moved = false;
+    let start = a.sock_state.selected();
+    for k in 300..420 {
+        a.set_snapshot(fixture(k));
+        render(&mut a, 160, 45);
+        let rows = a.sock_rows();
+        assert_eq!(
+            a.snap.sockets[rows[a.sock_state.selected().unwrap()]]
+                .sock
+                .cookie,
+            cookie
+        );
+        moved |= a.sock_state.selected() != start;
+    }
+    assert!(moved);
+}
+
+/// When the selected process disappears, the highlight stays on the same row.
+#[test]
+fn vanished_item_keeps_row() {
+    let mut a = app();
+    render(&mut a, 160, 45);
+    for _ in 0..3 {
+        key(&mut a, KeyCode::Down);
+    }
+    let (row, picked) = (a.proc_state.selected(), selected_name(&a));
+    let mut snap = fixture(299);
+    snap.procs.retain(|p| p.name != picked);
+    a.set_snapshot(snap);
+    render(&mut a, 160, 45);
+    assert_eq!(a.proc_state.selected(), row);
+    assert_ne!(selected_name(&a), picked);
+}
+
+#[test]
+fn grouping_keeps_the_selected_program() {
+    let mut a = app();
+    a.proc_sel = Some(super::ProcKey::Owner(Owner::Pid(1876864))); // the second "claude"
+    render(&mut a, 160, 45);
+    assert_eq!(selected_name(&a), "claude");
+    key(&mut a, KeyCode::Char('g'));
+    render(&mut a, 160, 45);
+    assert_eq!(selected_name(&a), "claude");
+    assert_eq!(
+        a.proc_views()[a.proc_state.selected().unwrap()]
+            .owners
+            .len(),
+        2
+    );
+    key(&mut a, KeyCode::Char('g'));
+    render(&mut a, 160, 45);
+    assert_eq!(selected_name(&a), "claude");
 }

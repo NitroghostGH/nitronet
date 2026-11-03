@@ -41,8 +41,9 @@ pub fn draw(app: &mut App, f: &mut Frame) {
     }
 
     let views = app.proc_views();
-    let socks = sock_rows(app);
-    let tabs = tab_title(app, body, views.len(), socks.len());
+    let socks = app.sock_rows();
+    app.sync_selection(&views, &socks);
+    let tabs = tab_title(app, body, [views.len(), socks.len()]);
 
     match app.tab {
         Tab::Procs => {
@@ -298,12 +299,13 @@ fn draw_header_compact(app: &App, f: &mut Frame, area: Rect) {
 
 /// The view switcher, drawn into the table panel's top border. The active
 /// view is a filled pill. Click regions are recorded for the mouse.
-fn tab_title(app: &mut App, panel: Rect, n_procs: usize, n_socks: usize) -> Line<'static> {
+fn tab_title(app: &mut App, panel: Rect, counts: [usize; 2]) -> Line<'static> {
     let t = theme();
     app.hit.tabs.clear();
     // Block titles start one cell in from the corner.
     let mut x = panel.x + 1;
     let mut spans = Vec::new();
+    let [n_procs, n_socks] = counts;
     for (tab, name, n) in [
         (Tab::Procs, "Processes", n_procs),
         (Tab::Sockets, "Sockets", n_socks),
@@ -624,60 +626,6 @@ fn proto_color(t: &Theme, p: Proto) -> Color {
     }
 }
 
-/// Indices into `app.snap.sockets` of the rows to show, filtered and sorted.
-fn sock_rows(app: &App) -> Vec<usize> {
-    let names = owner_names(app);
-    let name = |s: &SockRow| {
-        names
-            .iter()
-            .find(|(o, _)| *o == s.owner)
-            .map_or("?", |(_, n)| n.as_str())
-    };
-    let all = &app.snap.sockets;
-    let mut idx: Vec<usize> = (0..all.len())
-        .filter(|&i| !app.listening_only || all[i].sock.is_listening())
-        .filter(|&i| {
-            let s = &all[i];
-            let pid = match s.owner {
-                Owner::Pid(p) => p.to_string(),
-                _ => String::new(),
-            };
-            app.matches(&[
-                s.sock.proto.as_str(),
-                &fmt_addr(s.sock.local),
-                &fmt_addr(s.sock.remote),
-                s.sock.state_str(),
-                name(s),
-                &pid,
-            ])
-        })
-        .collect();
-    let rate = |i: &usize| all[*i].rate_in.unwrap_or(0.0) + all[*i].rate_out.unwrap_or(0.0);
-    let port_key = |i: &usize| (all[*i].sock.local.port(), all[*i].sock.proto);
-    match app.sock_sort {
-        SockSort::Rate => idx.sort_by(|a, b| {
-            rate(b)
-                .total_cmp(&rate(a))
-                .then(port_key(a).cmp(&port_key(b)))
-        }),
-        SockSort::Port => idx.sort_by_key(port_key),
-        SockSort::State => idx.sort_by_key(|i| (all[*i].sock.state_str(), port_key(i))),
-        SockSort::Program => idx.sort_by_key(|i| (name(&all[*i]).to_lowercase(), port_key(i))),
-    }
-    if app.reverse {
-        idx.reverse();
-    }
-    idx
-}
-
-fn owner_names(app: &App) -> Vec<(Owner, String)> {
-    app.snap
-        .procs
-        .iter()
-        .map(|p| (p.owner, p.name.clone()))
-        .collect()
-}
-
 const SOCK_COLS: [Col; 11] = [
     col("PROTO", 5, 0),
     col("LOCAL", 22, 0).flex(),
@@ -695,7 +643,7 @@ const SOCK_COLS: [Col; 11] = [
 fn draw_sockets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: Line<'static>) {
     let t = theme();
     let socks: Vec<&SockRow> = idx.iter().map(|&i| &app.snap.sockets[i]).collect();
-    let names = owner_names(app);
+    let names = app.owner_names();
     // Work out how wide the two flexible address columns will be, so the
     // addresses can be shortened in the middle rather than cut off at the end.
     let avail = area.width.saturating_sub(4 + MARKER);
@@ -988,8 +936,8 @@ fn draw_footer(app: &App, f: &mut Frame, area: Rect) {
         ("?", "help"),
         ("/", "filter"),
         ("tab", "switch"),
+        ("s", "sort"),
     ];
-    hints.push(("s", "sort"));
     match app.tab {
         Tab::Procs => {
             hints.push((

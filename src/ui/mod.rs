@@ -24,7 +24,7 @@ use ratatui::widgets::TableState;
 
 pub use fmt::{fmt_addr, human};
 
-use crate::sampler::{Owner, ProcRow, Sampler, Snapshot};
+use crate::sampler::{Owner, ProcRow, Sampler, Snapshot, SockRow};
 
 /// Samples kept for graphs. That's enough to fill a 300-column-wide graph at
 /// two samples per cell.
@@ -178,6 +178,37 @@ pub(crate) struct ProcView {
     pub owners: Vec<Owner>,
 }
 
+/// Which process row is selected, stored by identity rather than by row
+/// number. That way the highlight follows the item when the list re-sorts
+/// as rates change.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum ProcKey {
+    Owner(Owner),
+    /// A row grouped by program name.
+    Program(String),
+}
+
+impl ProcView {
+    fn key(&self, grouped: bool) -> ProcKey {
+        match self.row.owner {
+            Owner::Pid(_) if grouped => ProcKey::Program(self.row.name.clone()),
+            owner => ProcKey::Owner(owner),
+        }
+    }
+
+    /// Whether this row is the one `key` refers to. This holds across a
+    /// grouping toggle: a pid matches the group that contains it, and a program
+    /// name matches the first ungrouped process with that name.
+    fn is(&self, key: &ProcKey) -> bool {
+        match key {
+            ProcKey::Owner(o) => self.owners.contains(o),
+            ProcKey::Program(name) => {
+                matches!(self.row.owner, Owner::Pid(_)) && self.row.name == *name
+            }
+        }
+    }
+}
+
 /// Screen regions from the last frame, used to route mouse clicks.
 #[derive(Default)]
 pub(crate) struct HitMap {
@@ -202,6 +233,9 @@ pub(crate) struct App {
     pub editing_filter: bool,
     pub proc_state: TableState,
     pub sock_state: TableState,
+    /// The selected items by identity; the TableStates hold their current row.
+    pub proc_sel: Option<ProcKey>,
+    pub sock_sel: Option<u64>,
     pub history: History,
     pub hit: HitMap,
 }
@@ -224,6 +258,8 @@ impl App {
             editing_filter: false,
             proc_state: TableState::default().with_selected(0),
             sock_state: TableState::default().with_selected(0),
+            proc_sel: None,
+            sock_sel: None,
             history: History::default(),
             hit: HitMap::default(),
         };
@@ -243,10 +279,71 @@ impl App {
         }
     }
 
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.tab = tab;
+    }
+
+    /// Points each table's highlight at the row where its selected item is now.
+    /// If the item is gone (the process exited or the socket closed), the
+    /// highlight stays on the same row and takes whatever item is there.
+    /// This runs before every draw and every move.
+    pub fn sync_selection(&mut self, views: &[ProcView], socks: &[usize]) {
+        let row = match &self.proc_sel {
+            Some(key) => views.iter().position(|v| v.is(key)),
+            None => None,
+        };
+        let row = row.unwrap_or_else(|| self.proc_state.selected().unwrap_or(0));
+        self.select_proc(views, row);
+
+        let row = self.sock_sel.and_then(|cookie| {
+            socks
+                .iter()
+                .position(|&i| self.snap.sockets[i].sock.cookie == cookie)
+        });
+        let row = row.unwrap_or_else(|| self.sock_state.selected().unwrap_or(0));
+        self.select_sock(socks, row);
+    }
+
+    fn select_proc(&mut self, views: &[ProcView], row: usize) {
+        if views.is_empty() {
+            // Keep the key: if a filter hid the item, it comes back once the filter is cleared.
+            self.proc_state.select(None);
+            return;
+        }
+        let row = row.min(views.len() - 1);
+        self.proc_state.select(Some(row));
+        self.proc_sel = Some(views[row].key(self.group_by_program));
+    }
+
+    fn select_sock(&mut self, socks: &[usize], row: usize) {
+        if socks.is_empty() {
+            self.sock_state.select(None);
+            return;
+        }
+        let row = row.min(socks.len() - 1);
+        self.sock_state.select(Some(row));
+        self.sock_sel = Some(self.snap.sockets[socks[row]].sock.cookie);
+    }
+
+    /// Moves the current tab's selection. `to` maps (current row, row count) to the new row.
+    fn move_to(&mut self, to: impl FnOnce(usize, usize) -> usize) {
+        let views = self.proc_views();
+        let socks = self.sock_rows();
+        self.sync_selection(&views, &socks);
+        match self.tab {
+            Tab::Procs => {
+                let row = to(self.proc_state.selected().unwrap_or(0), views.len());
+                self.select_proc(&views, row);
+            }
+            Tab::Sockets => {
+                let row = to(self.sock_state.selected().unwrap_or(0), socks.len());
+                self.select_sock(&socks, row);
+            }
+        }
+    }
+
     fn move_by(&mut self, delta: isize) {
-        let state = self.state();
-        let sel = state.selected().unwrap_or(0);
-        state.select(Some(sel.saturating_add_signed(delta)));
+        self.move_to(|cur, _| cur.saturating_add_signed(delta));
     }
 
     /// Returns true when the user asks to quit.
@@ -275,7 +372,7 @@ impl App {
             }
             // New filter text means a new result list, so jump back to the top.
             if self.filter.len() != before {
-                self.state().select(Some(0));
+                self.move_to(|_, _| 0);
             }
             return false;
         }
@@ -289,26 +386,27 @@ impl App {
             KeyCode::Esc => {
                 if self.filter.is_empty() {
                     return true;
+                } else {
+                    self.filter.clear();
                 }
-                self.filter.clear();
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
             KeyCode::Char('/') => self.editing_filter = true,
             KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-                self.tab = if self.tab == Tab::Procs {
+                self.set_tab(if self.tab == Tab::Procs {
                     Tab::Sockets
                 } else {
                     Tab::Procs
-                }
+                })
             }
-            KeyCode::Char('1') => self.tab = Tab::Procs,
-            KeyCode::Char('2') => self.tab = Tab::Sockets,
+            KeyCode::Char('1') => self.set_tab(Tab::Procs),
+            KeyCode::Char('2') => self.set_tab(Tab::Sockets),
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::PageDown => self.move_by(20),
             KeyCode::PageUp => self.move_by(-20),
-            KeyCode::Home => self.state().select(Some(0)),
-            KeyCode::End => self.state().select(Some(usize::MAX)),
+            KeyCode::Home => self.move_to(|_, _| 0),
+            KeyCode::End => self.move_to(|_, len| len.saturating_sub(1)),
             KeyCode::Char('s') => self.cycle_sort(),
             KeyCode::Char('r') => self.reverse = !self.reverse,
             KeyCode::Char('g') => self.group_by_program = !self.group_by_program,
@@ -353,15 +451,70 @@ impl App {
                     return;
                 }
                 if let Some(&(_, tab)) = self.hit.tabs.iter().find(|(r, _)| r.contains(pos)) {
-                    self.tab = tab;
+                    self.set_tab(tab);
                 } else if self.hit.rows.contains(pos) {
-                    let offset = self.state().offset();
-                    let row = offset + (m.row - self.hit.rows.y) as usize;
-                    self.state().select(Some(row));
+                    let row = self.state().offset() + (m.row - self.hit.rows.y) as usize;
+                    self.move_to(|_, _| row);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Indices into `app.snap.sockets` of the rows to show, filtered and sorted.
+    pub fn sock_rows(&self) -> Vec<usize> {
+        let app = self;
+        let names = app.owner_names();
+        let name = |s: &SockRow| {
+            names
+                .iter()
+                .find(|(o, _)| *o == s.owner)
+                .map_or("?", |(_, n)| n.as_str())
+        };
+        let all = &app.snap.sockets;
+        let mut idx: Vec<usize> = (0..all.len())
+            .filter(|&i| !app.listening_only || all[i].sock.is_listening())
+            .filter(|&i| {
+                let s = &all[i];
+                let pid = match s.owner {
+                    Owner::Pid(p) => p.to_string(),
+                    _ => String::new(),
+                };
+                app.matches(&[
+                    s.sock.proto.as_str(),
+                    &fmt_addr(s.sock.local),
+                    &fmt_addr(s.sock.remote),
+                    s.sock.state_str(),
+                    name(s),
+                    &pid,
+                ])
+            })
+            .collect();
+        let rate = |i: &usize| all[*i].rate_in.unwrap_or(0.0) + all[*i].rate_out.unwrap_or(0.0);
+        let port_key = |i: &usize| (all[*i].sock.local.port(), all[*i].sock.proto);
+        match app.sock_sort {
+            SockSort::Rate => idx.sort_by(|a, b| {
+                rate(b)
+                    .total_cmp(&rate(a))
+                    .then(port_key(a).cmp(&port_key(b)))
+            }),
+            SockSort::Port => idx.sort_by_key(port_key),
+            SockSort::State => idx.sort_by_key(|i| (all[*i].sock.state_str(), port_key(i))),
+            SockSort::Program => idx.sort_by_key(|i| (name(&all[*i]).to_lowercase(), port_key(i))),
+        }
+        if app.reverse {
+            idx.reverse();
+        }
+        idx
+    }
+
+    pub fn owner_names(&self) -> Vec<(Owner, String)> {
+        let app = self;
+        app.snap
+            .procs
+            .iter()
+            .map(|p| (p.owner, p.name.clone()))
+            .collect()
     }
 
     pub fn matches(&self, fields: &[&str]) -> bool {
