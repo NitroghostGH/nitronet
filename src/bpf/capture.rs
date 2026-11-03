@@ -554,7 +554,7 @@ mod tests {
 
     /// Needs root: sudo -E cargo test live_capture -- --ignored
     #[test]
-    #[ignore]
+    #[ignore = "needs root (eBPF)"]
     fn live_capture() {
         use std::net::UdpSocket;
         let tracker = Tracker::start().expect("eBPF (run as root)");

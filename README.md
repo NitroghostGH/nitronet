@@ -17,6 +17,8 @@ The UI uses truecolor and never paints the terminal background, so transparent t
 
 UI changes can be reviewed without a terminal: `cargo test snapshots -- --ignored` writes colored HTML renders of every view (from deterministic fixture data) to `target/snapshots/`.
 
+`cargo test` runs everything that needs neither root nor this machine. The rest is ignored by default, each test saying why: `cargo test -- --ignored renders_live_data reads_live_neighbor_table` reads this machine's sockets and neighbor table, and the eBPF tests need root (`cargo test --no-run`, then run the test binary it names with `sudo` and `--ignored`, so `target/` doesn't end up owned by root). CI runs formatting, clippy, the tests that need no root, and a build with the oldest supported Rust, 1.88.
+
 ## How it works
 
 | What | Source |

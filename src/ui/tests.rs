@@ -796,7 +796,7 @@ fn to_html(b: &Buffer, title: &str) -> String {
 }
 
 #[test]
-#[ignore]
+#[ignore = "writes HTML snapshots to target/snapshots for looking at"]
 fn snapshots() {
     let dir = std::env::var("NITRONET_SNAPSHOT_DIR").unwrap_or_else(|_| "target/snapshots".into());
     std::fs::create_dir_all(&dir).unwrap();
@@ -886,6 +886,7 @@ fn snapshots() {
 
 /// Renders real data from this machine (unprivileged, tcp_info mode) in every view.
 #[test]
+#[ignore = "reads this machine's sockets (sock_diag), which a sandbox may not allow"]
 fn renders_live_data() {
     let mut sampler = crate::sampler::Sampler::new(false).expect("netlink sock_diag available");
     let mut a = App::new(sampler.sample().unwrap(), Duration::from_millis(200));
@@ -1061,7 +1062,7 @@ fn devices_tab_lists_sorts_and_follows_selection() {
 /// Scans the real network (unprivileged) and writes the Devices tab to
 /// target/snapshots/devices-live.html. It's ignored because it sends packets.
 #[test]
-#[ignore]
+#[ignore = "sends packets to the local network"]
 fn live_devices_snapshot() {
     let mut a = app();
     a.lan_state = crate::lan::scan_blocking();

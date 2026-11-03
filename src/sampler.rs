@@ -716,7 +716,7 @@ mod live {
 
     /// Needs root and network: sudo -E cargo test live_curl -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "needs root (eBPF), curl and the internet"]
     fn live_curl_capture() {
         let mut s = Sampler::new(true).unwrap();
         s.sample().unwrap();
@@ -774,7 +774,7 @@ mod live {
     /// be captured, and the form readable.
     /// sudo -E cargo test live_new_connection -- --ignored --nocapture
     #[test]
-    #[ignore]
+    #[ignore = "needs root (eBPF)"]
     fn live_new_connection_from_another_thread() {
         use std::io::{Read, Write};
         let me = std::fs::read_to_string("/proc/self/comm").unwrap();

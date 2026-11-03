@@ -439,6 +439,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads this machine's neighbor table (netlink), which a sandbox may not allow"]
     fn reads_live_neighbor_table() {
         // Works unprivileged; the table may legitimately be empty.
         for family in [libc::AF_INET, libc::AF_INET6] {

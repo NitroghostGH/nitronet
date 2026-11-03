@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # No third-party actions, to keep the supply chain small: plain git,
+      # and the rustup and cargo the runner already has.
+      - name: Check out
+        run: |
+          git init -q .
+          git fetch -q --depth 1 "https://github.com/${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
+
+      - name: Toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.88 --profile minimal
+
+      - name: Formatting
+        run: cargo +stable fmt --check
+
+      - name: Lints
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo +stable test --locked
+
+      - name: Tests that read this machine's sockets and neighbor table
+        run: cargo +stable test --locked -- --ignored renders_live_data reads_live_neighbor_table
+
+      - name: Minimum supported Rust (1.88)
+        run: cargo +1.88 build --locked --all-targets
