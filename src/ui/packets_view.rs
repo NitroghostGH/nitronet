@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph};
 
@@ -43,7 +43,7 @@ pub fn draw(
         draw_flows(app, f, table, flows, tabs);
         if with_detail {
             let sel = app.flow_state.selected().unwrap_or(0).min(len - 1);
-            draw_flow_detail(f, detail, &flows[sel]);
+            draw_flow_detail(app, f, detail, &flows[sel]);
         }
     } else {
         draw_packets(app, f, table, pkts, tabs);
@@ -247,21 +247,50 @@ fn pkt_cells(t: &Theme, p: &Packet) -> Vec<Cell<'static>> {
         Cell::from(remote),
         Cell::from(local),
         Cell::from(Line::from(Span::styled(p.len.to_string(), t.muted())).right_aligned()),
-        Cell::from(info_line(t, &info, p.content)),
+        Cell::from(info_line(t, &info, p.content, p.secret.is_some())),
     ]
 }
 
 /// The info column. The part after two spaces says what the payload is, and
-/// is green when it's readable, dim when encrypted.
-fn info_line(t: &Theme, info: &str, content: Content) -> Line<'static> {
-    match info.split_once("  ") {
-        Some((head, app)) => Line::from(vec![
-            Span::styled(head.to_string(), t.muted()),
-            Span::raw("  "),
-            Span::styled(app.to_string(), content_style(t, content)),
-        ]),
-        None => Line::from(Span::styled(info.to_string(), t.muted())),
+/// is green when it's readable, dim when encrypted. A login sent in clear
+/// gets a warning sign in front.
+fn info_line(t: &Theme, info: &str, content: Content, secret: bool) -> Line<'static> {
+    let mut spans = Vec::new();
+    if secret {
+        spans.push(Span::styled("⚠ ", t.fg(t.bad).add_modifier(Modifier::BOLD)));
     }
+    match info.split_once("  ") {
+        Some((head, app)) => {
+            spans.push(Span::styled(head.to_string(), t.muted()));
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(app.to_string(), content_style(t, content)));
+        }
+        None => spans.push(Span::styled(info.to_string(), t.muted())),
+    }
+    Line::from(spans)
+}
+
+/// The words of the filter to look for (not the `!` ones), lowercased.
+fn search_words(app: &App) -> Vec<String> {
+    app.filter
+        .to_lowercase()
+        .split_whitespace()
+        .filter(|w| !w.starts_with('!'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Which bytes of `b` are part of a filter match, to highlight them.
+fn match_mask(words: &[String], b: &[u8]) -> Vec<bool> {
+    let mut mask = vec![false; b.len()];
+    for w in words {
+        let mut from = 0;
+        while let Some(i) = packet::find_ignore_case_from(b, w.as_bytes(), from) {
+            mask[i..i + w.len()].fill(true);
+            from = i + 1;
+        }
+    }
+    mask
 }
 
 fn kv(t: &Theme, k: &str, v: Vec<Span<'static>>) -> Line<'static> {
@@ -394,9 +423,21 @@ fn draw_packet_detail(app: &mut App, f: &mut Frame, area: Rect, i: usize) {
         "content",
         vec![Span::styled(p.content.label(), content_style(t, p.content))],
     ));
-    if let Some(d) = &p.head {
+    if let Some(s) = p.secret {
+        let warn = t.fg(t.bad).add_modifier(Modifier::BOLD);
         lines.push(Line::default());
-        lines.extend(wrapped(t, "info", &d.info, w, t.fg(t.text)));
+        lines.push(kv(
+            t,
+            "warning",
+            vec![Span::styled(format!("⚠ {s}, unencrypted"), warn)],
+        ));
+        lines.extend(wrapped(
+            t,
+            "",
+            "anyone on the network path can read it",
+            w,
+            t.fg(t.text),
+        ));
     }
     f.render_widget(Paragraph::new(lines), fields);
 
@@ -411,12 +452,24 @@ fn draw_packet_detail(app: &mut App, f: &mut Frame, area: Rect, i: usize) {
 fn draw_hex(app: &mut App, f: &mut Frame, area: Rect, i: usize, per: usize) {
     let t = theme();
     let p = &app.packets[i];
-    let payload_at = p.head.as_ref().map_or(0, |d| d.payload_at);
+    let payload_at = p
+        .head
+        .as_ref()
+        .map_or(0, |d| d.payload_at)
+        .min(p.data.len());
+    let mut hits = vec![false; payload_at];
+    hits.extend(match_mask(&search_words(app), &p.data[payload_at..]));
     let total = p.data.len().div_ceil(per);
     let visible = area.height.saturating_sub(1) as usize;
     let max_scroll = total.saturating_sub(visible);
+    if std::mem::take(&mut app.pkt_jump)
+        && let Some(first) = hits.iter().position(|&h| h)
+    {
+        app.pkt_scroll = (first / per).saturating_sub(1);
+    }
     app.pkt_scroll = app.pkt_scroll.min(max_scroll);
     let p = &app.packets[i];
+    let found = t.badge(t.warn);
     let mut out = vec![Line::from(vec![
         Span::styled("BYTES", t.header()),
         Span::styled(format!(" {}", p.data.len()), t.muted()),
@@ -437,7 +490,9 @@ fn draw_hex(app: &mut App, f: &mut Frame, area: Rect, i: usize, per: usize) {
             if k > 0 {
                 spans.push(Span::styled(if k % 8 == 0 { "·" } else { " " }, t.faint()));
             }
-            let style = if off + k < payload_at {
+            let style = if hits[off + k] {
+                found
+            } else if off + k < payload_at {
                 t.muted()
             } else {
                 t.fg(t.text)
@@ -447,7 +502,9 @@ fn draw_hex(app: &mut App, f: &mut Frame, area: Rect, i: usize, per: usize) {
         let pad = (per - (end - off)) * 3;
         spans.push(Span::raw(" ".repeat(pad + 2)));
         for (k, &b) in p.data[off..end].iter().enumerate() {
-            let style = if off + k < payload_at {
+            let style = if hits[off + k] {
+                found
+            } else if off + k < payload_at {
                 t.faint()
             } else {
                 t.fg(t.accent)
@@ -467,26 +524,41 @@ fn draw_hex(app: &mut App, f: &mut Frame, area: Rect, i: usize, per: usize) {
 fn draw_payload_text(app: &mut App, f: &mut Frame, area: Rect, i: usize) {
     let t = theme();
     let p = &app.packets[i];
+    let payload = p.payload();
+    let hits = match_mask(&search_words(app), payload);
     let w = (area.width as usize).max(8);
     let mut rows: Vec<Line<'static>> = Vec::new();
-    for raw in p.payload().split(|&b| b == b'\n') {
+    // The row holding the first match.
+    let mut first_hit = None;
+    let mut at = 0;
+    for raw in payload.split(|&b| b == b'\n') {
+        let line_at = at;
+        at += raw.len() + 1;
         let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         if raw.is_empty() {
             rows.push(Line::default());
             continue;
         }
-        for chunk in raw.chunks(w) {
-            // Runs of printable and unprintable bytes, styled apart.
+        for (n, chunk) in raw.chunks(w).enumerate() {
+            let chunk_at = line_at + n * w;
+            // Runs of printable, unprintable and matching bytes, styled apart.
             let mut spans: Vec<Span<'static>> = Vec::new();
             let mut run = String::new();
-            let mut run_plain = true;
-            for &b in chunk {
+            let mut run_style = Style::default();
+            for (k, &b) in chunk.iter().enumerate() {
                 let plain = (0x20..0x7f).contains(&b) || b == b'\t';
-                if plain != run_plain && !run.is_empty() {
-                    let style = if run_plain { t.fg(t.text) } else { t.faint() };
-                    spans.push(Span::styled(std::mem::take(&mut run), style));
+                let style = if hits[chunk_at + k] {
+                    first_hit.get_or_insert(rows.len());
+                    t.badge(t.warn)
+                } else if plain {
+                    t.fg(t.text)
+                } else {
+                    t.faint()
+                };
+                if style != run_style && !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style));
                 }
-                run_plain = plain;
+                run_style = style;
                 run.push(match b {
                     b'\t' => ' ',
                     b if plain => b as char,
@@ -494,14 +566,18 @@ fn draw_payload_text(app: &mut App, f: &mut Frame, area: Rect, i: usize) {
                 });
             }
             if !run.is_empty() {
-                let style = if run_plain { t.fg(t.text) } else { t.faint() };
-                spans.push(Span::styled(run, style));
+                spans.push(Span::styled(run, run_style));
             }
             rows.push(Line::from(spans));
         }
     }
     let visible = area.height.saturating_sub(1) as usize;
     let max_scroll = rows.len().saturating_sub(visible);
+    if std::mem::take(&mut app.pkt_jump)
+        && let Some(row) = first_hit
+    {
+        app.pkt_scroll = row.saturating_sub(1);
+    }
     app.pkt_scroll = app.pkt_scroll.min(max_scroll);
     let p = &app.packets[i];
     let shown = p.payload().len();
@@ -583,6 +659,14 @@ fn flow_cells(t: &Theme, fl: &Flow) -> Vec<Cell<'static>> {
     } else {
         t.muted()
     };
+    let mut what = Vec::new();
+    if let Some(s) = fl.secret {
+        what.push(Span::styled(
+            format!("⚠ {s} · "),
+            t.fg(t.bad).add_modifier(Modifier::BOLD),
+        ));
+    }
+    what.push(Span::styled(fl.what(), what_style));
     let bytes = |b: u64| Line::from(Span::styled(human(b as f64), t.muted())).right_aligned();
     vec![
         Cell::from(Span::styled(packet::clock(fl.last), t.muted())),
@@ -595,11 +679,11 @@ fn flow_cells(t: &Theme, fl: &Flow) -> Vec<Cell<'static>> {
         ),
         Cell::from(bytes(fl.bytes_in)),
         Cell::from(bytes(fl.bytes_out)),
-        Cell::from(Span::styled(fl.what(), what_style)),
+        Cell::from(Line::from(what)),
     ]
 }
 
-fn draw_flow_detail(f: &mut Frame, area: Rect, fl: &Flow) {
+fn draw_flow_detail(app: &App, f: &mut Frame, area: Rect, fl: &Flow) {
     let t = theme();
     let pid = match fl.owner {
         Owner::Pid(pid) => format!("pid {pid} · "),
@@ -611,11 +695,11 @@ fn draw_flow_detail(f: &mut Frame, area: Rect, fl: &Flow) {
         Span::styled(format!("  {pid}conversation "), t.muted()),
     ]);
     let block = panel().title(title).title_bottom(
-        Line::from(Span::styled(" enter shows its packets ", t.faint())).right_aligned(),
+        Line::from(Span::styled(" enter lists its packets ", t.faint())).right_aligned(),
     );
     let inner = block.inner(area).inner(Margin::new(1, 0));
     f.render_widget(block, area);
-    let [fields, seen] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)])
+    let [fields, timeline] = Layout::horizontal([Constraint::Fill(2), Constraint::Fill(3)])
         .spacing(3)
         .areas(inner);
 
@@ -637,18 +721,17 @@ fn draw_flow_detail(f: &mut Frame, area: Rect, fl: &Flow) {
         }
     }
     let span = match fl.last.duration_since(fl.first) {
-        Ok(d) if fl.packets() > 1 => format!(" · over {:.1}s", d.as_secs_f64()),
+        Ok(d) if fl.packets() > 1 => format!(" · {:.1}s", d.as_secs_f64()),
         _ => String::new(),
     };
-    let lines = vec![
+    let mut lines = vec![
         kv(t, "remote", endpoint_line(fl.key.remote, w).spans),
         kv(t, "local", endpoint_line(fl.key.local, w).spans),
-        kv(t, "protocol", vec![text(fl.key.proto.to_string())]),
         kv(
             t,
             "packets",
             vec![
-                text(format!("{}", fl.packets())),
+                text(format!("{} {}", fl.packets(), fl.key.proto)),
                 Span::styled(format!(" · {} sent", fl.sent), t.fg(t.tx)),
                 Span::styled(format!(" · {} received", fl.received), t.fg(t.rx)),
             ],
@@ -676,11 +759,25 @@ fn draw_flow_detail(f: &mut Frame, area: Rect, fl: &Flow) {
         ),
         kv(t, "content", mix),
     ];
-    f.render_widget(Paragraph::new(lines), fields);
-
-    let mut out = vec![Line::from(Span::styled("READABLE IN IT", t.header()))];
+    if let Some(s) = fl.secret {
+        let n = if fl.secrets > 1 {
+            format!(" ({} packets)", fl.secrets)
+        } else {
+            String::new()
+        };
+        lines.push(kv(
+            t,
+            "warning",
+            vec![Span::styled(
+                format!("⚠ {s} unencrypted{n}"),
+                t.fg(t.bad).add_modifier(Modifier::BOLD),
+            )],
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled("READABLE IN IT", t.header())));
     if fl.names.is_empty() {
-        out.push(Line::from(Span::styled(
+        lines.push(Line::from(Span::styled(
             match fl.encrypted_why {
                 Some(why) => format!("nothing: it's encrypted ({why})"),
                 None => "nothing recognized".into(),
@@ -688,17 +785,69 @@ fn draw_flow_detail(f: &mut Frame, area: Rect, fl: &Flow) {
             t.muted(),
         )));
     }
-    let sw = seen.width as usize;
+    let fw = fields.width as usize;
     for n in &fl.names {
-        let mut chars: Vec<char> = n.chars().collect();
-        if chars.len() > sw.saturating_sub(2) {
-            chars.truncate(sw.saturating_sub(3));
-            chars.push('…');
-        }
-        out.push(Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled("· ", t.fg(t.accent)),
-            Span::styled(chars.into_iter().collect::<String>(), t.fg(t.good)),
+            Span::styled(elide_end(n, fw.saturating_sub(2)), t.fg(t.good)),
         ]));
     }
-    f.render_widget(Paragraph::new(out), seen);
+    f.render_widget(Paragraph::new(lines), fields);
+    draw_flow_timeline(app, f, timeline, fl);
+}
+
+/// The conversation's packets in order, one line each: time since its first
+/// packet, direction, size and what it is.
+fn draw_flow_timeline(app: &App, f: &mut Frame, area: Rect, fl: &Flow) {
+    let t = theme();
+    let pkts: Vec<&Packet> = app
+        .packets
+        .iter()
+        .filter(|p| app.pkt_passes(p) && p.flow().as_ref() == Some(&fl.key))
+        .collect();
+    let mut out = vec![Line::from(vec![
+        Span::styled("PACKETS", t.header()),
+        Span::styled(format!(" {}", pkts.len()), t.muted()),
+    ])];
+    let rows = (area.height as usize).saturating_sub(1);
+    // With too many to show, the last row says how many are left out.
+    let shown = if pkts.len() > rows {
+        rows.saturating_sub(1)
+    } else {
+        pkts.len()
+    };
+    let w = area.width as usize;
+    for p in &pkts[..shown] {
+        let since =
+            p.at.duration_since(fl.first)
+                .unwrap_or_default()
+                .as_secs_f64();
+        let since = if since < 100.0 {
+            format!("+{since:.3}")
+        } else {
+            format!("+{since:.0}s")
+        };
+        let dir = if p.outgoing {
+            Span::styled(" → ", t.fg(t.tx))
+        } else {
+            Span::styled(" ← ", t.fg(t.rx))
+        };
+        let info = p.head.as_ref().map_or("?", |d| d.info.as_str());
+        let used = 7 + 3 + 6;
+        let mut spans = vec![
+            Span::styled(format!("{since:>7}"), t.faint()),
+            dir,
+            Span::styled(format!("{:>5} ", p.len), t.muted()),
+        ];
+        let room = w.saturating_sub(used + if p.secret.is_some() { 2 } else { 0 });
+        spans.extend(info_line(t, &elide_end(info, room), p.content, p.secret.is_some()).spans);
+        out.push(Line::from(spans));
+    }
+    if shown < pkts.len() {
+        out.push(Line::from(Span::styled(
+            format!("… {} more · enter lists them all", pkts.len() - shown),
+            t.faint(),
+        )));
+    }
+    f.render_widget(Paragraph::new(out), area);
 }

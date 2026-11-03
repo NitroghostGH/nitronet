@@ -397,8 +397,9 @@ fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Link::None,
             "",
         ),
-        row("or opened by a captured name?", Link::None, ""),
-        row("  catches new processes at once", Link::None, ""),
+        row("or opened by a captured program?", Link::None, ""),
+        row("  by thread name or process id,", Link::None, ""),
+        row("  so new sockets match at once", Link::None, ""),
         row(
             "yes: copy its first 2 KB",
             Link::Right,
@@ -480,6 +481,14 @@ fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         t.text,
         &["anything else: not text and not random, e.g. a game's own protocol"],
     ));
+    out.extend(label(
+        "⚠ login",
+        t.bad,
+        &[
+            "a readable packet carrying a password field (password=, \"password\":),",
+            "an Authorization header, or an FTP/POP3/SMTP/IMAP login",
+        ],
+    ));
     out.push(Line::from(Span::styled(
         "These are guesses from the bytes. Nothing is decrypted.",
         t.muted(),
@@ -509,7 +518,11 @@ fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         "sent and received → sent only → received only",
         dir_now,
     ));
-    out.push(key("e", "all → with data → unencrypted only", content_now));
+    out.push(key(
+        "e",
+        "all → with data → unencrypted → logins in clear",
+        content_now,
+    ));
     out.push(key(
         "f",
         "conversations: one row per connection, with what was readable in it",
@@ -522,8 +535,13 @@ fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     ));
     out.push(key(
         "/",
-        "filter: every word must match, !word excludes (\"dns !mdns\")",
+        "filter: every word must match, !word excludes (\"dns !mdns\");",
         (!app.filter.is_empty()).then(|| format!("\"{}\"", app.filter)),
+    ));
+    out.push(key(
+        "",
+        "payloads are searched too, and matches are highlighted",
+        None,
     ));
     out.push(key("t", "show the payload as text instead of hex", None));
     out.push(key("[ ]", "scroll the payload", None));

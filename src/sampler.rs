@@ -475,6 +475,7 @@ impl Sampler {
                 head: packet::decode(&data, len),
                 data,
                 content: Content::Empty,
+                secret: None,
             };
             self.classifier.apply(&mut p);
             self.pending.push(p);

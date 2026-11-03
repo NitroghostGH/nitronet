@@ -602,6 +602,7 @@ pub(crate) fn packet_fixture(first_id: u64) -> Vec<crate::packet::Packet> {
                 head: decode(&data, len),
                 data,
                 content: crate::packet::Content::Empty,
+                secret: None,
             }
         })
         .map(|mut p| {
@@ -853,7 +854,7 @@ fn snapshots() {
             "packets-conversations",
             180,
             46,
-            &[KeyCode::Char('4'), KeyCode::Char('f'), KeyCode::Down],
+            &[KeyCode::Char('4'), KeyCode::Char('f')],
         ),
         (
             "diagram-packets",
@@ -1427,5 +1428,128 @@ fn h_on_packets_explains_capture() {
             // The full-size popup (92 columns) has 88 inside.
             assert!(w < 88 || l.width() <= 88, "too wide: {text:?}");
         }
+    }
+}
+
+/// A router login sent over plain HTTP: firefox opens a new connection and
+/// POSTs a form with the password in it.
+fn login_packets(first_id: u64) -> Vec<crate::packet::Packet> {
+    use crate::packet::tests::ipv4;
+    use crate::packet::{Classifier, Packet, decode};
+    let (me, router) = ([192, 168, 0, 74], [192, 168, 0, 1]);
+    let mut body = b"POST /login HTTP/1.1\r\nHost: 192.168.0.1\r\n".to_vec();
+    body.extend_from_slice(&b"Accept: */*\r\n".repeat(20));
+    body.extend_from_slice(b"\r\nusername=admin&password=hunter2");
+    let list = [
+        (true, ipv4(6, me, router, 50100, 80, 0x02, &[])),
+        (false, ipv4(6, router, me, 80, 50100, 0x12, &[])),
+        (true, ipv4(6, me, router, 50100, 80, 0x18, &body)),
+        (
+            false,
+            ipv4(
+                6,
+                router,
+                me,
+                80,
+                50100,
+                0x18,
+                b"HTTP/1.1 302 Found\r\n\r\n",
+            ),
+        ),
+    ];
+    let mut c = Classifier::default();
+    list.into_iter()
+        .enumerate()
+        .map(|(i, (outgoing, data))| {
+            let len = data.len() as u32;
+            let mut p = Packet {
+                id: first_id + i as u64,
+                at: std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(i as u64 * 2),
+                owner: Owner::Pid(1050831),
+                program: "firefox".into(),
+                outgoing,
+                len,
+                head: decode(&data, len),
+                data,
+                content: crate::packet::Content::Empty,
+                secret: None,
+            };
+            c.apply(&mut p);
+            p
+        })
+        .collect()
+}
+
+#[test]
+fn logins_in_clear_are_flagged_and_searchable() {
+    let mut a = app();
+    a.add_packets(login_packets(1000));
+    key(&mut a, KeyCode::Char('4'));
+    let post = a.packets.iter().find(|p| p.secret.is_some()).unwrap();
+    assert_eq!(post.secret, Some("password field"));
+    assert_eq!(a.packets.iter().filter(|p| p.secret.is_some()).count(), 1);
+
+    // e, three times: only logins in clear.
+    for _ in 0..3 {
+        key(&mut a, KeyCode::Char('e'));
+    }
+    assert_eq!(a.pkt_content, super::ContentFilter::Secrets);
+    let rows = a.pkt_rows();
+    assert_eq!(rows.len(), 1);
+    let text = buffer_text(&render(&mut a, 180, 46));
+    assert!(text.contains("logins in clear · 1 of 16 packets"), "{text}");
+    assert!(text.contains("⚠ [P.]"), "{text}");
+    assert!(text.contains("⚠ password field, unencrypted"), "{text}");
+    key(&mut a, KeyCode::Char('e'));
+
+    // The filter searches payloads; the match is highlighted and scrolled to,
+    // in hex and in text.
+    key(&mut a, KeyCode::Char('/'));
+    for c in "hunter2".chars() {
+        key(&mut a, KeyCode::Char(c));
+    }
+    key(&mut a, KeyCode::Enter);
+    assert_eq!(a.pkt_rows().len(), 1);
+    let b = render(&mut a, 180, 46);
+    assert!(a.pkt_scroll > 0, "the hex dump should scroll to the match");
+    let found = super::theme::theme().badge(super::theme::theme().warn);
+    let highlighted = |b: &Buffer| -> String {
+        let mut s = String::new();
+        for y in 0..b.area.height {
+            for x in 0..b.area.width {
+                if b[(x, y)].style().bg == found.bg && b[(x, y)].bg != Color::Reset {
+                    s.push_str(b[(x, y)].symbol());
+                }
+            }
+        }
+        s
+    };
+    // Here the match straddles two rows: "h" ends one, "unter2" starts the next.
+    let h = highlighted(&b);
+    assert!(
+        h.contains("68") && h.contains("756e74657232") && h.contains("unter2"),
+        "{h}"
+    );
+    key(&mut a, KeyCode::Char('t'));
+    let b = render(&mut a, 180, 46);
+    assert!(buffer_text(&b).contains("username=admin&password=hunter2"));
+    assert!(highlighted(&b).contains("hunter2"));
+
+    // Its conversation carries the warning and lists the exchange.
+    key(&mut a, KeyCode::Char('f'));
+    let flows = a.flows();
+    assert_eq!(flows.len(), 1);
+    assert_eq!(flows[0].secrets, 1);
+    a.filter.clear();
+    a.flow_sel = Some(flows[0].key.clone());
+    let text = buffer_text(&render(&mut a, 180, 46));
+    for want in [
+        "⚠ password field · POST /login HTTP/1.1",
+        "⚠ password field unencrypted",
+        "PACKETS 4",
+        "+0.002 ←",
+        "+0.004 →",
+    ] {
+        assert!(text.contains(want), "missing {want:?}\n{text}");
     }
 }

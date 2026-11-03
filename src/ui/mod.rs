@@ -307,6 +307,9 @@ pub(crate) struct App {
     /// The packet the highlight is on, and how far its hex dump is scrolled.
     pub pkt_cur: Option<u64>,
     pub pkt_scroll: usize,
+    /// Set when the highlight moves to another packet: the payload view then
+    /// scrolls to the first filter match in it.
+    pub pkt_jump: bool,
     /// `i`, `e`: which packets to show.
     pub pkt_dir: DirFilter,
     pub pkt_content: ContentFilter,
@@ -362,6 +365,7 @@ impl App {
             pkt_sel: None,
             pkt_cur: None,
             pkt_scroll: 0,
+            pkt_jump: false,
             pkt_dir: DirFilter::Both,
             pkt_content: ContentFilter::All,
             pkt_flows: false,
@@ -535,6 +539,7 @@ impl App {
         if self.pkt_cur != Some(id) {
             self.pkt_cur = Some(id);
             self.pkt_scroll = 0;
+            self.pkt_jump = true;
         }
         // On the newest row, keep following new packets.
         self.pkt_sel = (row != self.newest_row(pkts)).then_some(id);
@@ -643,6 +648,7 @@ impl App {
             }
             // New filter text means a new result list, so jump back to the top.
             if self.filter.len() != before {
+                self.pkt_jump = true;
                 self.move_to(|_, _| 0);
             }
             return false;
@@ -720,6 +726,7 @@ impl App {
             KeyCode::Char('t') if self.tab == Tab::Packets => {
                 self.pkt_text = !self.pkt_text;
                 self.pkt_scroll = 0;
+                self.pkt_jump = true;
             }
             KeyCode::Enter if self.tab == Tab::Packets && self.pkt_flows => self.open_flow(),
             KeyCode::Char(']') if self.tab == Tab::Packets => {
@@ -983,11 +990,19 @@ impl App {
     /// The filter: every word must appear in some field, and a word starting
     /// with `!` must appear in none ("dns !mdns", "firefox 443").
     pub fn matches(&self, fields: &[&str]) -> bool {
+        self.matches_with_bytes(fields, &[])
+    }
+
+    /// `matches`, where `bytes` (a packet's payload) counts as a field too.
+    pub fn matches_with_bytes(&self, fields: &[&str], bytes: &[u8]) -> bool {
         if self.filter.trim().is_empty() {
             return true;
         }
         let fields: Vec<String> = fields.iter().map(|f| f.to_lowercase()).collect();
-        let hit = |w: &str| fields.iter().any(|f| f.contains(w));
+        let hit = |w: &str| {
+            fields.iter().any(|f| f.contains(w))
+                || crate::packet::find_ignore_case(bytes, w.as_bytes()).is_some()
+        };
         self.filter
             .to_lowercase()
             .split_whitespace()

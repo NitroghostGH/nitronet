@@ -27,6 +27,9 @@ pub struct Packet {
     pub head: Option<Decoded>,
     /// What the payload looks like. Set by `Classifier`.
     pub content: Content,
+    /// What kind of login secret the payload carries unencrypted, if any
+    /// ("password field", "HTTP Basic login"). Set by `Classifier`.
+    pub secret: Option<&'static str>,
 }
 
 impl Packet {
@@ -654,6 +657,9 @@ impl Classifier {
             _ => {}
         }
         p.content = content;
+        if content.unencrypted_data() {
+            p.secret = credentials(p.payload());
+        }
         let preview = match content {
             Content::Plain("text") => Some(printable_line(p.payload(), 80)),
             Content::Encrypted(why) => Some(format!("encrypted ({why})")),
@@ -730,6 +736,95 @@ impl Classifier {
             c => c,
         }
     }
+}
+
+/// Where `needle` first appears in `hay`, ignoring ASCII case.
+pub fn find_ignore_case(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    find_ignore_case_from(hay, needle, 0)
+}
+
+/// Like `find_ignore_case`, starting at `from`.
+pub fn find_ignore_case_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let (&first, rest) = needle.split_first()?;
+    let first = first.to_ascii_lowercase();
+    let last = hay.len().checked_sub(needle.len())?;
+    (from..=last).find(|&i| {
+        hay[i].to_ascii_lowercase() == first
+            && hay[i + 1..i + needle.len()].eq_ignore_ascii_case(rest)
+    })
+}
+
+/// What kind of login secret a readable payload carries, if any: a password
+/// field in a form, JSON or query string, an HTTP Authorization header, or
+/// the login commands of FTP, POP3, SMTP and IMAP.
+pub fn credentials(b: &[u8]) -> Option<&'static str> {
+    // Header names and commands are case-insensitive.
+    let find = |needle: &[u8]| find_ignore_case(b, needle);
+    let at_line_start = |i: usize| i == 0 || b[i - 1] == b'\n';
+    if let Some(i) = find(b"authorization: basic ")
+        && at_line_start(i)
+    {
+        // base64 of "user:password": anyone can decode it.
+        return Some("HTTP Basic login");
+    }
+    if let Some(i) = find(b"authorization:")
+        && at_line_start(i)
+    {
+        return Some("HTTP Authorization header");
+    }
+    // A password-like key followed by a value: form fields and query strings
+    // (password=…), JSON ("password": "…").
+    for key in [&b"password"[..], b"passwd", b"passphrase", b"pwd", b"pass"] {
+        let mut from = 0;
+        while let Some(i) = find_ignore_case_from(b, key, from) {
+            from = i + 1;
+            // The key must be a whole word: "pass" in "bypass=" doesn't count.
+            let before = if i == 0 { b' ' } else { b[i - 1] };
+            if before.is_ascii_alphanumeric() {
+                continue;
+            }
+            let rest = &b[i + key.len()..];
+            let value = match rest {
+                [b'=', v, ..] => *v,
+                [b'"', b':', ..] => {
+                    let v = rest[2..].iter().find(|c| **c != b' ');
+                    match v {
+                        Some(b'"') => rest[2..]
+                            .iter()
+                            .skip_while(|c| **c == b' ')
+                            .nth(1)
+                            .copied()
+                            .unwrap_or(b'"'),
+                        _ => b'"',
+                    }
+                }
+                _ => continue,
+            };
+            // An empty value isn't a password being sent.
+            if !matches!(value, b'&' | b'"' | b'\r' | b'\n' | b' ') {
+                return Some("password field");
+            }
+        }
+    }
+    for line in b.split(|&c| c == b'\n') {
+        let mut words = line.split(|&c| c == b' ').filter(|w| !w.is_empty());
+        let (first, second) = (words.next().unwrap_or(b""), words.next());
+        if first.eq_ignore_ascii_case(b"PASS") && second.is_some() {
+            return Some("PASS command (FTP, POP3)");
+        }
+        if first.eq_ignore_ascii_case(b"AUTH")
+            && second.is_some_and(|s| {
+                s.eq_ignore_ascii_case(b"PLAIN") || s.eq_ignore_ascii_case(b"LOGIN")
+            })
+        {
+            return Some("SMTP login");
+        }
+        // IMAP: "a001 LOGIN user password".
+        if second.is_some_and(|s| s.eq_ignore_ascii_case(b"LOGIN")) && words.nth(1).is_some() {
+            return Some("IMAP login");
+        }
+    }
+    None
 }
 
 /// Whether bytes start like gzip, zstd or xz data.
@@ -1007,6 +1102,7 @@ pub(crate) mod tests {
             head: decode(&data, len),
             data,
             content: Content::Empty,
+            secret: None,
         }
     }
 
@@ -1114,6 +1210,80 @@ pub(crate) mod tests {
         let (k, _) = run(ipv4(UDP, me, srv, 5009, 9999, 0, &gz), true);
         assert_eq!(k, Content::Compressed);
         assert!(Content::Compressed.unencrypted_data());
+    }
+
+    #[test]
+    fn finds_credentials_in_clear() {
+        let yes: &[(&[u8], &str)] = &[
+            (b"username=admin&password=hunter2", "password field"),
+            (b"user=a&pwd=x", "password field"),
+            (b"GET /login?user=a&pass=b HTTP/1.1\r\n", "password field"),
+            (
+                br#"{"username":"a","password": "hunter2"}"#,
+                "password field",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nAuthorization: Basic YTpi\r\n\r\n",
+                "HTTP Basic login",
+            ),
+            (
+                b"GET / HTTP/1.1\r\nauthorization: Bearer xyz\r\n\r\n",
+                "HTTP Authorization header",
+            ),
+            (b"PASS hunter2\r\n", "PASS command (FTP, POP3)"),
+            (b"AUTH PLAIN AGFAYg==\r\n", "SMTP login"),
+            (b"a001 LOGIN alice hunter2\r\n", "IMAP login"),
+        ];
+        for (b, want) in yes {
+            assert_eq!(
+                credentials(b),
+                Some(*want),
+                "{}",
+                String::from_utf8_lossy(b)
+            );
+        }
+        let no: &[&[u8]] = &[
+            b"GET /forgot-password HTTP/1.1\r\n",
+            b"bypass=1&compass=north",
+            b"password=&user=a",
+            br#"{"password": ""}"#,
+            b"The password is never sent.",
+            b"X-Authorization-Hint: none\r\n",
+            b"a001 LOGOUT\r\n",
+        ];
+        for b in no {
+            assert_eq!(credentials(b), None, "{}", String::from_utf8_lossy(b));
+        }
+        // Set on readable packets only.
+        let mut c = Classifier::default();
+        let mut p = packet(
+            ipv4(
+                TCP,
+                [10, 0, 0, 2],
+                [10, 0, 0, 1],
+                5000,
+                80,
+                0x18,
+                b"user=a&password=b",
+            ),
+            true,
+        );
+        c.apply(&mut p);
+        assert_eq!(p.secret, Some("password field"));
+        let mut p = packet(
+            ipv4(
+                TCP,
+                [10, 0, 0, 2],
+                [10, 0, 0, 1],
+                5000,
+                443,
+                0x18,
+                b"user=a&password=b",
+            ),
+            true,
+        );
+        c.apply(&mut p);
+        assert_eq!(p.secret, None);
     }
 
     #[test]

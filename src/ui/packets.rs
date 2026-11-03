@@ -41,6 +41,8 @@ pub(crate) enum ContentFilter {
     Data,
     /// Only packets whose payload isn't encrypted.
     Unencrypted,
+    /// Only packets carrying a password or login unencrypted.
+    Secrets,
 }
 
 impl ContentFilter {
@@ -48,7 +50,8 @@ impl ContentFilter {
         match self {
             ContentFilter::All => ContentFilter::Data,
             ContentFilter::Data => ContentFilter::Unencrypted,
-            ContentFilter::Unencrypted => ContentFilter::All,
+            ContentFilter::Unencrypted => ContentFilter::Secrets,
+            ContentFilter::Secrets => ContentFilter::All,
         }
     }
     pub fn label(self) -> &'static str {
@@ -56,13 +59,15 @@ impl ContentFilter {
             ContentFilter::All => "all packets",
             ContentFilter::Data => "with data",
             ContentFilter::Unencrypted => "unencrypted",
+            ContentFilter::Secrets => "logins in clear",
         }
     }
-    fn allows(self, c: Content) -> bool {
+    fn allows(self, p: &Packet) -> bool {
         match self {
             ContentFilter::All => true,
-            ContentFilter::Data => c != Content::Empty,
-            ContentFilter::Unencrypted => c.unencrypted_data(),
+            ContentFilter::Data => p.content != Content::Empty,
+            ContentFilter::Unencrypted => p.content.unencrypted_data(),
+            ContentFilter::Secrets => p.secret.is_some(),
         }
     }
 }
@@ -113,6 +118,9 @@ pub(crate) struct Flow {
     pub binary: usize,
     /// Why it's encrypted, from its first encrypted packet.
     pub encrypted_why: Option<&'static str>,
+    /// Packets carrying a login secret unencrypted, and the first one's kind.
+    pub secrets: usize,
+    pub secret: Option<&'static str>,
 }
 
 impl Flow {
@@ -139,13 +147,13 @@ const MAX_NAMES: usize = 6;
 impl App {
     /// Whether a packet passes the direction and content filters, and is in
     /// the conversation being looked at (if any).
-    fn pkt_passes(&self, p: &Packet) -> bool {
+    pub(super) fn pkt_passes(&self, p: &Packet) -> bool {
         let dir = match self.pkt_dir {
             DirFilter::Both => true,
             DirFilter::Sent => p.outgoing,
             DirFilter::Received => !p.outgoing,
         };
-        dir && self.pkt_content.allows(p.content)
+        dir && self.pkt_content.allows(p)
             && self
                 .pkt_flow
                 .as_ref()
@@ -158,27 +166,7 @@ impl App {
         let mut idx: Vec<usize> = (0..self.packets.len())
             .filter(|&i| {
                 let p = &self.packets[i];
-                if !self.pkt_passes(p) {
-                    return false;
-                }
-                if self.filter.is_empty() {
-                    return true;
-                }
-                let pid = match p.owner {
-                    Owner::Pid(p) => p.to_string(),
-                    _ => String::new(),
-                };
-                let (local, remote) = p
-                    .ends()
-                    .map(|(l, r)| (l.to_string(), r.to_string()))
-                    .unwrap_or_default();
-                let (proto, info) = p
-                    .head
-                    .as_ref()
-                    .map(|d| (d.proto(), d.info.as_str()))
-                    .unwrap_or(("?", ""));
-                let content = p.content.label();
-                self.matches(&[&p.program, &pid, &local, &remote, proto, info, &content])
+                self.pkt_passes(p) && self.pkt_matches(p)
             })
             .collect();
         if self.reverse {
@@ -187,10 +175,41 @@ impl App {
         idx
     }
 
+    /// Whether a packet matches the text filter. Its payload is searched too,
+    /// so "/password" finds the packet that carries one.
+    fn pkt_matches(&self, p: &Packet) -> bool {
+        if self.filter.is_empty() {
+            return true;
+        }
+        let pid = match p.owner {
+            Owner::Pid(p) => p.to_string(),
+            _ => String::new(),
+        };
+        let (local, remote) = p
+            .ends()
+            .map(|(l, r)| (l.to_string(), r.to_string()))
+            .unwrap_or_default();
+        let (proto, info) = p
+            .head
+            .as_ref()
+            .map(|d| (d.proto(), d.info.as_str()))
+            .unwrap_or(("?", ""));
+        let content = p.content.label();
+        let secret = p.secret.unwrap_or_default();
+        self.matches_with_bytes(
+            &[
+                &p.program, &pid, &local, &remote, proto, info, &content, secret,
+            ],
+            p.payload(),
+        )
+    }
+
     /// The conversations among the packets that pass the filters, sorted.
     pub fn flows(&self) -> Vec<Flow> {
         let mut index: HashMap<FlowKey, usize> = HashMap::new();
         let mut flows: Vec<Flow> = Vec::new();
+        // Conversations with a packet that matches the text filter by itself.
+        let mut hit: Vec<bool> = Vec::new();
         for p in &self.packets {
             if !self.pkt_passes(p) {
                 continue;
@@ -214,9 +233,15 @@ impl App {
                     empty: 0,
                     binary: 0,
                     encrypted_why: None,
+                    secrets: 0,
+                    secret: None,
                 });
+                hit.push(false);
                 flows.len() - 1
             });
+            if !hit[i] && !self.filter.is_empty() {
+                hit[i] = self.pkt_matches(p);
+            }
             let f = &mut flows[i];
             if p.outgoing {
                 f.sent += 1;
@@ -226,6 +251,10 @@ impl App {
                 f.bytes_in += p.len as u64;
             }
             f.last = p.at;
+            if let Some(s) = p.secret {
+                f.secrets += 1;
+                f.secret.get_or_insert(s);
+            }
             match p.content {
                 Content::Empty => f.empty += 1,
                 Content::Binary | Content::Compressed => f.binary += 1,
@@ -245,8 +274,9 @@ impl App {
             }
         }
 
+        let mut hit = hit.into_iter();
         flows.retain(|f| {
-            if self.filter.is_empty() {
+            if hit.next() == Some(true) || self.filter.is_empty() {
                 return true;
             }
             let pid = match f.owner {

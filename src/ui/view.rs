@@ -1090,7 +1090,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         (
             "view",
             &[
-                ("/", "filter: words must all match, !word excludes"),
+                ("/", "filter: all words match, !word excludes"),
                 ("s  r", "cycle sort · reverse it"),
                 ("g", "group processes by program"),
                 ("l", "only listening sockets"),
@@ -1109,7 +1109,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             &[
                 ("c", "capture the selected program (root)"),
                 ("i", "sent · received · both"),
-                ("e", "all · with data · unencrypted"),
+                ("e", "all · data · unencrypted · logins"),
                 ("f", "conversations; enter opens one"),
                 ("t", "payload as text or hex"),
                 ("[  ]", "scroll the payload"),
