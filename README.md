@@ -43,13 +43,13 @@ If eBPF can't be loaded (not root, old kernel, or the verifier refuses), nitrone
 
 ### Devices (LAN scanner)
 
-The **Devices** tab lists what's on your local network. Nothing is sent until you first open it. After that it rescans every minute (`R` rescans now). It scans the subnet of the default-route interface, up to a /22. On a larger subnet it scans the /24 around your address.
+The **Devices** tab lists what's on your local network. Nothing is sent until you first open it. While the tab is open it rescans every minute (`R` rescans now); on other tabs it stays quiet. It scans the Ethernet or Wi-Fi interface the default route uses, never a VPN tunnel, and its subnet up to a /22. On a larger subnet it scans the /24 around your address.
 
 | What | How |
 |---|---|
 | Discovery (root) | Raw ARP requests on an `AF_PACKET` socket, three passes. Retries only ask silent addresses, and go unicast to MACs the kernel already knows, because sleeping Wi-Fi phones often ignore broadcast ARP. Finds devices that block ping. |
 | Discovery (no root) | Ping sweep over an unprivileged ICMP socket (UDP to the discard port if ping sockets are disabled). The kernel resolves every address, and MACs are read from its neighbor table (netlink `RTM_GETNEIGH`). Stale neighbor entries can make a device that just left look online. |
-| Discovery (IPv6) | A /64 is far too big to sweep, so it pings the all-nodes multicast group `ff02::1`, which every IPv6 host joins. It does this once from the link-local address and once from each global address, because hosts answer from an address in the same scope. It runs alongside the IPv4 sweep, so it adds no time, and needs no root. MACs come from the IPv6 neighbor table. |
+| Discovery (IPv6) | A /64 is far too big to sweep, so it pings the all-nodes multicast group `ff02::1`, which every IPv6 host joins. It does this once from the link-local address and once from each global address, because hosts answer from an address in the same scope. It runs alongside the IPv4 sweep, so it adds no time, and needs no root. MACs come from the IPv6 neighbor table. Anyone on the LAN can see the multicast ping and answer it from any address, so only link-local and on-link replies count, and only replies to addresses actually asked count for IPv4. Devices offline for a day are forgotten. |
 | One row per device | IPv4 and IPv6 addresses are joined by MAC, so a dual-stack device is one row. An address whose MAC the kernel hasn't learned yet is resolved with a UDP datagram, or decoded from an EUI-64 address. Hosts that ignore multicast ping (Windows) still get their IPv6 addresses from the neighbor table when IPv4 found them. |
 | Names | `getnameinfo` reverse lookups, which on systemd-resolved include mDNS (`PS5-AABB03.local`) and LLMNR. Tried on IPv4 first, then IPv6. ISP-generated IPv6 names that just restate the address (`2001-db8-…ip6.example.net`) are ignored. |
 | Vendor | MAC prefix looked up in the IEEE registry from the `hwdata` package (`/usr/share/hwdata/oui.txt`). Randomized "private" MACs are flagged instead. |

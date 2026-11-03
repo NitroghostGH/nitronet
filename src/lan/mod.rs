@@ -3,7 +3,7 @@
 //! same time. Addresses are joined into devices by MAC, so a dual-stack host
 //! is one device. It names devices (reverse DNS, which on systemd-resolved
 //! also covers mDNS and LLMNR) and identifies vendors from MAC prefixes. The
-//! UI reads a snapshot of the shared state each frame.
+//! UI takes a copy of the shared state whenever it has changed.
 
 pub mod discover;
 pub mod identify;
@@ -18,9 +18,14 @@ use crate::netlink::{NUD_REACHABLE, Neighbor};
 use discover::{Iface, Mac, Reply6};
 use identify::Vendors;
 
-/// Time between automatic rescans once scanning has started.
+/// Time between automatic rescans while the Devices tab is open.
 pub const RESCAN: Duration = Duration::from_secs(60);
 const NAME_WORKERS: usize = 8;
+/// Devices kept at most. A /22 has 1022 addresses, and devices with IPv6 add
+/// a few more; past this, the ones offline longest are forgotten.
+const MAX_DEVICES: usize = 2048;
+/// Devices offline this long are forgotten.
+const FORGET_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 /// What identifies a device across scans: its MAC, or an address when the
 /// MAC isn't known (yet).
@@ -130,11 +135,16 @@ pub struct LanState {
     /// Why the IPv6 scan failed, if it did.
     pub ipv6_error: Option<String>,
     pub devices_v6: usize,
+    /// Goes up whenever the scanner changes anything, so the UI can tell when
+    /// it needs a fresh copy.
+    pub version: u64,
 }
 
 enum Cmd {
     Scan,
     Probe(DevKey),
+    /// Whether to rescan every RESCAN (while the Devices tab is open).
+    Auto(bool),
 }
 
 pub struct Lan {
@@ -142,7 +152,14 @@ pub struct Lan {
     tx: Sender<Cmd>,
 }
 
+/// Locks the state to change it. Every use bumps the version.
 fn lock(state: &Mutex<LanState>) -> MutexGuard<'_, LanState> {
+    let mut s = read(state);
+    s.version += 1;
+    s
+}
+
+fn read(state: &Mutex<LanState>) -> MutexGuard<'_, LanState> {
     // A panicked worker leaves usable data behind; keep going with it.
     state.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -168,8 +185,19 @@ impl Lan {
         let _ = self.tx.send(Cmd::Probe(key));
     }
 
+    /// Rescans every minute while on, as long as the Devices tab is open.
+    pub fn set_auto(&self, on: bool) {
+        let _ = self.tx.send(Cmd::Auto(on));
+    }
+
     pub fn snapshot(&self) -> LanState {
-        lock(&self.state).clone()
+        read(&self.state).clone()
+    }
+
+    /// A copy of the state, if it changed since `version`.
+    pub fn snapshot_since(&self, version: u64) -> Option<LanState> {
+        let s = read(&self.state);
+        (s.version != version).then(|| s.clone())
     }
 }
 
@@ -185,8 +213,10 @@ fn worker(state: Arc<Mutex<LanState>>, rx: mpsc::Receiver<Cmd>) {
             Err(e) => s.error = Some(e.to_string()),
         }
     }
-    let mut next: Option<Instant> = None;
+    let mut auto = false;
+    let mut last: Option<Instant> = None;
     loop {
+        let next = last.filter(|_| auto).map(|t| t + RESCAN);
         let wait = next.map_or(Duration::from_secs(3600), |n| {
             n.saturating_duration_since(Instant::now())
         });
@@ -196,12 +226,17 @@ fn worker(state: Arc<Mutex<LanState>>, rx: mpsc::Receiver<Cmd>) {
                 start_probe(&state, key);
                 false
             }
+            Ok(Cmd::Auto(on)) => {
+                auto = on;
+                // Back on the tab after a while away: catch up now.
+                on && last.is_some_and(|t| t.elapsed() >= RESCAN)
+            }
             Err(RecvTimeoutError::Timeout) => next.is_some(),
             Err(RecvTimeoutError::Disconnected) => return,
         };
         if scan {
             run_scan(&state, &vendors, is_root);
-            next = Some(Instant::now() + RESCAN);
+            last = Some(Instant::now());
         }
     }
 }
@@ -339,12 +374,13 @@ fn run_scan(state: &Arc<Mutex<LanState>>, vendors: &Vendors, is_root: bool) {
     for d in s.devices.values_mut() {
         d.online = false;
     }
+    let mut index = ip_index(&s.devices);
     let observed = obs
         .into_iter()
         .map(|o| (o, false))
         .chain(std::iter::once((me, true)));
     for (o, is_self) in observed {
-        let d = upsert(&mut s.devices, &o, now, !first_scan);
+        let d = upsert(&mut s.devices, &mut index, &o, now, !first_scan);
         d.online = true;
         d.last_seen = now;
         d.mac = o.mac.or(d.mac);
@@ -370,7 +406,11 @@ fn run_scan(state: &Arc<Mutex<LanState>>, vendors: &Vendors, is_root: bool) {
             d.name = hostname();
             d.name_tried = true;
         }
+        for ip in d.ips() {
+            index.insert(ip, d.key);
+        }
     }
+    forget_old(&mut s.devices, now);
     s.ipv6_error = ipv6_error;
     s.devices_v6 = s
         .devices
@@ -498,10 +538,37 @@ fn observations(
         .collect()
 }
 
+/// Which device has each address, to find a device by address without
+/// going through them all. Entries can go stale as devices change address,
+/// so a hit is checked against the device itself.
+type IpIndex = HashMap<IpAddr, DevKey>;
+
+fn ip_index(devices: &BTreeMap<DevKey, Device>) -> IpIndex {
+    devices
+        .values()
+        .flat_map(|d| d.ips().map(move |ip| (ip, d.key)))
+        .collect()
+}
+
+/// The devices that share an address with an observation.
+fn overlapping(devices: &BTreeMap<DevKey, Device>, index: &IpIndex, o: &Obs) -> Vec<DevKey> {
+    let mut keys: Vec<DevKey> =
+        o.v4.map(IpAddr::V4)
+            .into_iter()
+            .chain(o.v6.iter().map(|a| IpAddr::V6(*a)))
+            .filter_map(|ip| index.get(&ip))
+            .filter(|k| devices.get(k).is_some_and(|d| d.overlaps(o)))
+            .copied()
+            .collect();
+    keys.dedup();
+    keys
+}
+
 /// Finds the device an observation belongs to, or adds it. Entries made
 /// before the device's MAC was known are folded into the MAC-keyed one.
 fn upsert<'a>(
     devices: &'a mut BTreeMap<DevKey, Device>,
+    index: &mut IpIndex,
     o: &Obs,
     now: Instant,
     new: bool,
@@ -509,25 +576,26 @@ fn upsert<'a>(
     let key = match o.mac {
         Some(m) => {
             let key = DevKey::Mac(m);
-            let orphans: Vec<DevKey> = devices
-                .values()
-                .filter(|d| d.mac.is_none() && d.overlaps(o))
-                .map(|d| d.key)
+            let orphans: Vec<DevKey> = overlapping(devices, index, o)
+                .into_iter()
+                .filter(|k| devices[k].mac.is_none())
                 .collect();
             for k in orphans {
                 if let Some(mut d) = devices.remove(&k)
                     && !devices.contains_key(&key)
                 {
                     d.key = key;
+                    for ip in d.ips() {
+                        index.insert(ip, key);
+                    }
                     devices.insert(key, d);
                 }
             }
             key
         }
-        None => devices
-            .values()
-            .find(|d| d.overlaps(o))
-            .map(|d| d.key)
+        None => overlapping(devices, index, o)
+            .first()
+            .copied()
             .or(o.v4.map(DevKey::V4))
             .or(o.v6.first().map(|a| DevKey::V6(*a)))
             .expect("an observation has an address"),
@@ -538,6 +606,23 @@ fn upsert<'a>(
         d.ipv6 = o.v6.clone();
         d
     })
+}
+
+/// Forgets devices offline for a day, then the ones offline longest while
+/// there are more than MAX_DEVICES.
+fn forget_old(devices: &mut BTreeMap<DevKey, Device>, now: Instant) {
+    devices.retain(|_, d| d.online || now.duration_since(d.last_seen) < FORGET_AFTER);
+    if devices.len() > MAX_DEVICES {
+        let mut offline: Vec<(Instant, DevKey)> = devices
+            .values()
+            .filter(|d| !d.online && !d.is_self)
+            .map(|d| (d.last_seen, d.key))
+            .collect();
+        offline.sort();
+        for (_, k) in offline.into_iter().take(devices.len() - MAX_DEVICES) {
+            devices.remove(&k);
+        }
+    }
 }
 
 /// Reverse lookups on a few worker threads, since a lookup that fails can take
@@ -723,7 +808,9 @@ mod tests {
             v4: Some(ip),
             ..Obs::default()
         };
-        upsert(&mut devices, &first, now, false).name = Some("printer".into());
+        let mut index = IpIndex::new();
+        upsert(&mut devices, &mut index, &first, now, false).name = Some("printer".into());
+        index = ip_index(&devices);
         assert!(devices.contains_key(&DevKey::V4(ip)));
 
         let second = Obs {
@@ -731,7 +818,7 @@ mod tests {
             mac: Some(PS5),
             ..Obs::default()
         };
-        let d = upsert(&mut devices, &second, now, false);
+        let d = upsert(&mut devices, &mut index, &second, now, false);
         assert_eq!(d.key, DevKey::Mac(PS5));
         assert_eq!(d.name.as_deref(), Some("printer"));
         assert_eq!(devices.len(), 1);
@@ -742,10 +829,37 @@ mod tests {
             ..Obs::default()
         };
         assert_eq!(
-            upsert(&mut devices, &third, now, false).key,
+            upsert(&mut devices, &mut index, &third, now, false).key,
             DevKey::Mac(PS5)
         );
         assert_eq!(devices.len(), 1);
+    }
+
+    #[test]
+    fn forgets_devices_offline_for_long() {
+        let now = Instant::now() + 2 * FORGET_AFTER;
+        let mut devices = BTreeMap::new();
+        for i in 0..(MAX_DEVICES + 10) as u32 {
+            let ip = Ipv4Addr::from(0x0a00_0000 + i);
+            let mut d = Device::new(DevKey::V4(ip), now, false);
+            d.ipv4 = Some(ip);
+            // The first ten are online; the rest went offline one by one.
+            d.online = i < 10;
+            d.last_seen = now - Duration::from_secs(u64::from(i));
+            devices.insert(d.key, d);
+        }
+        let mut gone = Device::new(DevKey::V4(Ipv4Addr::new(10, 9, 9, 9)), now, false);
+        gone.online = false;
+        gone.last_seen = now - FORGET_AFTER - Duration::from_secs(1);
+        devices.insert(gone.key, gone);
+
+        forget_old(&mut devices, now);
+        assert_eq!(devices.len(), MAX_DEVICES);
+        assert!(!devices.contains_key(&DevKey::V4(Ipv4Addr::new(10, 9, 9, 9))));
+        // Online devices stay; the ones offline longest went first.
+        assert!(devices.values().filter(|d| d.online).count() == 10);
+        let last = Ipv4Addr::from(0x0a00_0000 + (MAX_DEVICES + 9) as u32);
+        assert!(!devices.contains_key(&DevKey::V4(last)));
     }
 
     #[test]

@@ -266,7 +266,7 @@ pub fn lines(app: &App, width: u16) -> Vec<Line<'static>> {
         inner,
         dim("scans when you first open Devices,"),
     ));
-    out.push(under_right(inner, dim("then every 60s (R rescans now)")));
+    out.push(under_right(inner, dim("then every 60s while open (R now)")));
     out.push(Line::default());
     let now = match (s.scanning, s.last_scan) {
         (Some((done, total)), _) => vec![ok(format!("scanning… {done}/{total}"))],

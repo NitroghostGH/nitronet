@@ -50,9 +50,20 @@ pub fn run(
     let mut app = App::new(first, interval);
     app.lan = Some(Lan::start());
     let mut next = Instant::now() + interval;
+    let mut lan_version = 0;
+    let mut lan_auto = false;
     loop {
         if let Some(lan) = &app.lan {
-            app.lan_state = lan.snapshot();
+            if let Some(s) = lan.snapshot_since(lan_version) {
+                lan_version = s.version;
+                app.lan_state = s;
+            }
+            // Rescan every minute only while the Devices tab is open.
+            let auto = app.tab == Tab::Devices;
+            if auto != lan_auto {
+                lan_auto = auto;
+                lan.set_auto(auto);
+            }
         }
         if app.capture_dirty {
             app.capture_dirty = false;

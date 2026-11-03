@@ -107,27 +107,39 @@ fn mask(prefix: u8) -> u32 {
     }
 }
 
-/// The interface the default route uses, falling back to the first interface
-/// that is up, not loopback, and has an IPv4 address.
+/// Whether an interface is Ethernet or Wi-Fi (ARPHRD_ETHER). Tunnels such as
+/// VPNs are other types, and their networks aren't ours to sweep.
+fn is_ethernet(name: &str) -> bool {
+    fs::read_to_string(format!("/sys/class/net/{name}/type")).is_ok_and(|t| t.trim() == "1")
+}
+
+/// The Ethernet or Wi-Fi interface the default route uses, falling back to the
+/// first one that is up, not loopback, and has an IPv4 address.
 pub fn find_iface() -> io::Result<Iface> {
     let (route_if, gateway) = default_route().unzip();
     let all = if_addrs()?;
     let v4: Vec<(String, Ipv4Addr, u8)> = all
         .iter()
+        .filter(|(n, _, _)| is_ethernet(n))
         .filter_map(|(n, ip, p)| match ip {
             IpAddr::V4(ip) => Some((n.clone(), *ip, *p)),
             IpAddr::V6(_) => None,
         })
         .collect();
-    let (name, ip, prefix) = route_if
-        .and_then(|r| v4.iter().find(|a| a.0 == r).cloned())
-        .or_else(|| v4.first().cloned())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "no network interface with an IPv4 address",
-            )
-        })?;
+    let via_route = route_if
+        .as_ref()
+        .and_then(|r| v4.iter().find(|a| a.0 == *r).cloned());
+    // A default route through a tunnel (a VPN) has no gateway on the LAN.
+    let gateway = if via_route.is_some() { gateway } else { None };
+    let (name, ip, prefix) = via_route.or_else(|| v4.first().cloned()).ok_or_else(|| {
+        let why = match &route_if {
+            Some(r) if !is_ethernet(r) => {
+                format!("no Ethernet or Wi-Fi interface with an IPv4 address (the default route uses {r}, which isn't one)")
+            }
+            _ => "no Ethernet or Wi-Fi interface with an IPv4 address".to_string(),
+        };
+        io::Error::new(io::ErrorKind::NotFound, crate::text::clean(&why))
+    })?;
 
     let cname = CString::new(name.clone()).map_err(io::Error::other)?;
     // SAFETY: cname is a valid NUL-terminated string.
@@ -279,6 +291,11 @@ const PING_ROUNDS: usize = 2;
 /// Pause between requests, so a /22 sweep takes about a second instead of
 /// bursting 1000 packets at once.
 const PACE: Duration = Duration::from_micros(800);
+/// At most this many packets are read per drain, so a flood of replies (or of
+/// other traffic on a raw socket) can't keep a receive loop spinning.
+const MAX_DRAIN: usize = 256;
+/// At most this many IPv6 addresses are taken from one all-nodes ping.
+pub const MAX_REPLIES6: usize = 1024;
 
 fn fd_from(r: libc::c_int) -> io::Result<OwnedFd> {
     if r < 0 {
@@ -318,9 +335,13 @@ fn sweep(
     let mut drain = |sent_at: &HashMap<Ipv4Addr, Instant>,
                      got: &mut HashMap<Ipv4Addr, Reply>|
      -> io::Result<()> {
-        while let Some((ip, mac)) = recv()? {
-            let rtt = sent_at.get(&ip).map(|t| t.elapsed());
-            got.entry(ip).or_insert(Reply { ip, mac, rtt });
+        for _ in 0..MAX_DRAIN {
+            let Some((ip, mac)) = recv()? else { break };
+            // Only addresses we asked: anyone on the LAN can send replies.
+            if let Some(t) = sent_at.get(&ip) {
+                let rtt = Some(t.elapsed());
+                got.entry(ip).or_insert(Reply { ip, mac, rtt });
+            }
         }
         Ok(())
     };
@@ -434,24 +455,28 @@ pub fn arp_sweep(
                 Ok(())
             }
         },
-        || loop {
-            // SAFETY: buf is valid for writes of buf.len() bytes.
-            let n = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                return if e.kind() == io::ErrorKind::WouldBlock {
-                    Ok(None)
-                } else {
-                    Err(e)
-                };
+        || {
+            for _ in 0..MAX_DRAIN {
+                // SAFETY: buf is valid for writes of buf.len() bytes.
+                let n = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    return if e.kind() == io::ErrorKind::WouldBlock {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    };
+                }
+                let f = &buf[..n as usize];
+                // Only ARP replies (op 2). Our own requests are seen here too.
+                if f.len() >= 42 && f[12..14] == ETH_P_ARP.to_be_bytes() && f[20..22] == [0, 2] {
+                    let mac: Mac = f[22..28].try_into().unwrap();
+                    let ip = Ipv4Addr::new(f[28], f[29], f[30], f[31]);
+                    return Ok(Some((ip, Some(mac))));
+                }
             }
-            let f = &buf[..n as usize];
-            // Only ARP replies (op 2). Our own requests are seen here too.
-            if f.len() >= 42 && f[12..14] == ETH_P_ARP.to_be_bytes() && f[20..22] == [0, 2] {
-                let mac: Mac = f[22..28].try_into().unwrap();
-                let ip = Ipv4Addr::new(f[28], f[29], f[30], f[31]);
-                return Ok(Some((ip, Some(mac))));
-            }
+            // Busy with other ARP traffic: come back after the next send.
+            Ok(None)
         },
         progress,
     )
@@ -498,35 +523,38 @@ pub fn ping_sweep(targets: &[Ipv4Addr], progress: &dyn Fn(usize, usize)) -> io::
                 Ok(())
             }
         },
-        || loop {
-            // SAFETY: zeroed sockaddr_in is valid; buf and from are valid for writes.
-            let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    raw,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                    (&raw mut from).cast(),
-                    &mut len,
-                )
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                return if e.kind() == io::ErrorKind::WouldBlock {
-                    Ok(None)
-                } else {
-                    Err(e)
+        || {
+            for _ in 0..MAX_DRAIN {
+                // SAFETY: zeroed sockaddr_in is valid; buf and from are valid for writes.
+                let mut from: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+                let mut len = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                let n = unsafe {
+                    libc::recvfrom(
+                        raw,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        0,
+                        (&raw mut from).cast(),
+                        &mut len,
+                    )
                 };
+                if n < 0 {
+                    let e = io::Error::last_os_error();
+                    return if e.kind() == io::ErrorKind::WouldBlock {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    };
+                }
+                if n >= 1 && buf[0] == 0 {
+                    // echo reply
+                    return Ok(Some((
+                        Ipv4Addr::from(from.sin_addr.s_addr.to_ne_bytes()),
+                        None,
+                    )));
+                }
             }
-            if n >= 1 && buf[0] == 0 {
-                // echo reply
-                return Ok(Some((
-                    Ipv4Addr::from(from.sin_addr.s_addr.to_ne_bytes()),
-                    None,
-                )));
-            }
+            Ok(None)
         },
         progress,
     )
@@ -615,6 +643,7 @@ pub fn nudge6(addrs: &[Ipv6Addr], index: u32) {
     for a in addrs {
         let to = std::net::SocketAddrV6::new(*a, 9, 0, scope_for(a, index));
         let _ = sock.send_to(&[], to);
+        std::thread::sleep(PACE);
     }
     std::thread::sleep(Duration::from_millis(400));
 }
@@ -745,7 +774,8 @@ impl Ping6 {
 
     /// The source of the next pending echo reply, or None when nothing is pending.
     fn recv(&self, buf: &mut [u8]) -> io::Result<Option<Ipv6Addr>> {
-        loop {
+        // Other ICMPv6 traffic is skipped, but not forever.
+        for _ in 0..MAX_DRAIN {
             // SAFETY: zeroed sockaddr_in6 is valid; buf and from are valid for writes.
             let mut from: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
             let mut len = size_of::<libc::sockaddr_in6>() as libc::socklen_t;
@@ -777,7 +807,18 @@ impl Ping6 {
                 return Ok(Some(Ipv6Addr::from(from.sin6_addr.s6_addr)));
             }
         }
+        Ok(None)
     }
+}
+
+/// Whether `ip` can be a neighbor: link-local, or inside one of the
+/// interface's prefixes. Anything else is off the LAN.
+pub fn is_on_link(ip: &Ipv6Addr, ours: &[(Ipv6Addr, u8)]) -> bool {
+    ip.is_unicast_link_local()
+        || ours.iter().any(|(a, len)| {
+            (1..=128).contains(len)
+                && (u128::from(*a) ^ u128::from(*ip)) >> (128 - u32::from(*len)) == 0
+        })
 }
 
 /// Pings ff02::1 on the interface from each of our IPv6 addresses, twice,
@@ -795,6 +836,9 @@ pub fn ping6_all_nodes(iface: &Iface) -> io::Result<Vec<Reply6>> {
         return Err(err.unwrap_or_else(|| io::Error::other("no IPv6 address on the interface")));
     }
     let mine: HashSet<Ipv6Addr> = iface.ipv6.iter().map(|(a, _)| *a).collect();
+    // The echo request is multicast, so any host on the LAN can see it and
+    // forge replies from any source. Only on-link addresses count.
+    let on_link = |ip: &Ipv6Addr| is_on_link(ip, &iface.ipv6);
     let mut got: HashMap<Ipv6Addr, Duration> = HashMap::new();
     let mut buf = [0u8; 256];
     for round in 0..PING6_ROUNDS {
@@ -832,8 +876,9 @@ pub fn ping6_all_nodes(iface: &Iface) -> io::Result<Vec<Reply6>> {
                 if p.revents & libc::POLLIN == 0 {
                     continue;
                 }
-                while let Some(ip) = s.recv(&mut buf)? {
-                    if !mine.contains(&ip) {
+                for _ in 0..MAX_DRAIN {
+                    let Some(ip) = s.recv(&mut buf)? else { break };
+                    if !mine.contains(&ip) && on_link(&ip) && got.len() < MAX_REPLIES6 {
                         got.entry(ip).or_insert_with(|| sent.elapsed());
                     }
                 }
@@ -902,6 +947,74 @@ fn restates_address(name: &str, ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_on_link_ipv6_counts() {
+        let ours = [("2001:db8:1:2::5".parse().unwrap(), 64)];
+        let on = |s: &str| is_on_link(&s.parse().unwrap(), &ours);
+        assert!(on("fe80::1"));
+        assert!(on("2001:db8:1:2:aaaa::9"));
+        assert!(!on("2001:db8:1:3::9")); // the next /64
+        assert!(!on("2606:4700::1111")); // the internet
+        assert!(!on("ff02::1"));
+        // A /0 or /128 prefix doesn't match everything or overflow.
+        assert!(!is_on_link(
+            &"2606:4700::1".parse().unwrap(),
+            &[(Ipv6Addr::UNSPECIFIED, 0)]
+        ));
+        assert!(is_on_link(
+            &"2001:db8::5".parse().unwrap(),
+            &[("2001:db8::5".parse().unwrap(), 128)]
+        ));
+    }
+
+    #[test]
+    fn sweep_ignores_replies_from_addresses_not_asked() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = OwnedFd::from(sock);
+        let asked = Ipv4Addr::new(192, 168, 0, 7);
+        let mut inbox = vec![
+            (Ipv4Addr::new(8, 8, 8, 8), None),
+            (Ipv4Addr::new(192, 168, 0, 200), None),
+            (asked, None),
+        ];
+        let got = sweep(
+            &[asked],
+            1,
+            &fd,
+            |_, _, _| Ok(()),
+            || Ok(inbox.pop()),
+            &|_, _| {},
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ip, asked);
+        assert!(got[0].rtt.is_some());
+    }
+
+    #[test]
+    fn a_reply_flood_does_not_stall_the_sweep() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = OwnedFd::from(sock);
+        let mut reads = 0usize;
+        let start = Instant::now();
+        sweep(
+            &[Ipv4Addr::new(192, 168, 0, 7)],
+            1,
+            &fd,
+            |_, _, _| Ok(()),
+            || {
+                reads += 1;
+                Ok(Some((Ipv4Addr::new(10, 0, 0, 1), None)))
+            },
+            &|_, _| {},
+        )
+        .unwrap();
+        // One capped drain after the send; the socket itself never becomes
+        // readable, so the linger reads nothing more.
+        assert_eq!(reads, MAX_DRAIN);
+        assert!(start.elapsed() < LINGER + Duration::from_secs(1));
+    }
 
     #[test]
     fn macs() {
