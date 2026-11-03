@@ -6,7 +6,7 @@
 //! cut down to printable ASCII before it reaches the terminal, so a packet
 //! can't smuggle in escape sequences.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::SystemTime;
 
@@ -88,6 +88,9 @@ pub enum Content {
     Encrypted(&'static str),
     /// Payload that is neither text nor random-looking (some binary protocol).
     Binary,
+    /// Random-looking, but in a conversation that is plain HTTP (a gzip or
+    /// brotli body), or starting with a compression format's magic bytes.
+    Compressed,
 }
 
 impl Content {
@@ -97,11 +100,16 @@ impl Content {
             Content::Plain(why) => format!("plain · {why}"),
             Content::Encrypted(why) => format!("encrypted · {why}"),
             Content::Binary => "binary".into(),
+            Content::Compressed => "compressed".into(),
         }
     }
-    /// Whether the payload can be read: plain or an unrecognized binary format.
+    /// Whether the payload is sent unencrypted: plain, compressed, or an
+    /// unrecognized binary format.
     pub fn unencrypted_data(&self) -> bool {
-        matches!(self, Content::Plain(_) | Content::Binary)
+        matches!(
+            self,
+            Content::Plain(_) | Content::Binary | Content::Compressed
+        )
     }
 }
 
@@ -603,13 +611,24 @@ const ENCRYPTED_PORTS: &[(&str, u16, &str)] = &[
     ("UDP", 51820, "WireGuard port"),
 ];
 
-/// Sorts packets into plain, encrypted, empty and binary. It remembers which
-/// conversations turned out to be encrypted, so the middle of a TLS stream
-/// (segments that don't start a TLS record) is still marked encrypted.
+/// Sorts packets into empty, plain, encrypted, compressed and binary. It
+/// remembers which conversations turned out to be encrypted, so the middle of
+/// a TLS stream (segments that don't start a TLS record) is still marked
+/// encrypted, and which speak HTTP, so their compressed bodies aren't.
 #[derive(Default)]
 pub struct Classifier {
     encrypted: HashMap<FlowKey, &'static str>,
+    /// Conversations seen speaking HTTP, whose random-looking packets are
+    /// compressed bodies rather than encryption.
+    http: HashSet<FlowKey>,
 }
+
+/// Remembered conversations are forgotten in bulk past this many.
+const MAX_FLOWS: usize = 50_000;
+
+/// The reason `guess` gives for high-entropy bytes. Only a hint, so it isn't
+/// remembered for the rest of the conversation.
+const RANDOM: &str = "looks random";
 
 impl Classifier {
     /// Sets `p.content`, and adds a hint to the info line when the decoder
@@ -617,16 +636,28 @@ impl Classifier {
     pub fn apply(&mut self, p: &mut Packet) {
         let flow = p.flow();
         let content = self.classify(p, flow.as_ref());
-        if let (Content::Encrypted(why), Some(f)) = (content, flow) {
-            if self.encrypted.len() > 50_000 {
-                self.encrypted.clear();
+        match (content, flow) {
+            // A protocol known to be encrypted (TLS, QUIC, SSH, its port): the
+            // rest of the conversation is too, even mid-record segments.
+            (Content::Encrypted(why), Some(f)) if why != RANDOM => {
+                if self.encrypted.len() > MAX_FLOWS {
+                    self.encrypted.clear();
+                }
+                self.encrypted.entry(f).or_insert(why);
             }
-            self.encrypted.entry(f).or_insert(why);
+            (Content::Plain("HTTP"), Some(f)) => {
+                if self.http.len() > MAX_FLOWS {
+                    self.http.clear();
+                }
+                self.http.insert(f);
+            }
+            _ => {}
         }
         p.content = content;
         let preview = match content {
             Content::Plain("text") => Some(printable_line(p.payload(), 80)),
             Content::Encrypted(why) => Some(format!("encrypted ({why})")),
+            Content::Compressed => Some("compressed".to_string()),
             _ => None,
         };
         if let (Some(extra), Some(d)) = (preview, p.head.as_mut())
@@ -690,8 +721,22 @@ impl Classifier {
             }
         }
         // Finally, the bytes themselves.
-        guess(payload)
+        match guess(payload) {
+            Content::Encrypted(RANDOM)
+                if compressed_magic(payload) || flow.is_some_and(|f| self.http.contains(f)) =>
+            {
+                Content::Compressed
+            }
+            c => c,
+        }
     }
+}
+
+/// Whether bytes start like gzip, zstd or xz data.
+fn compressed_magic(b: &[u8]) -> bool {
+    b.starts_with(&[0x1f, 0x8b, 0x08])
+        || b.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+        || b.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0])
 }
 
 fn looks_like_http(app: &str) -> bool {
@@ -731,7 +776,7 @@ fn guess(b: &[u8]) -> Content {
         .sum();
     let max = n.min(256.0).log2();
     if b.len() >= 64 && h >= 0.9 * max {
-        Content::Encrypted("looks random")
+        Content::Encrypted(RANDOM)
     } else {
         Content::Binary
     }
@@ -1027,6 +1072,48 @@ pub(crate) mod tests {
         let (k, _) = run(ipv4(UDP, me, srv, 5006, 9999, 0, &[0u8; 100]), true);
         assert_eq!(k, Content::Binary);
         assert!(Content::Binary.unencrypted_data() && !Content::Empty.unencrypted_data());
+
+        // Random-looking bytes are only a hint: the conversation isn't marked
+        // encrypted, so readable text later on it is still plain.
+        let (k, _) = run(ipv4(TCP, me, srv, 5007, 9000, 0x18, &random), true);
+        assert_eq!(k, Content::Encrypted("looks random"));
+        let (k, _) = run(
+            ipv4(
+                TCP,
+                me,
+                srv,
+                5007,
+                9000,
+                0x18,
+                b"user=admin&password=hunter2",
+            ),
+            true,
+        );
+        assert_eq!(k, Content::Plain("text"));
+
+        // On an HTTP conversation they're a compressed body, and so is
+        // anything starting with gzip's magic bytes.
+        let (k, _) = run(
+            ipv4(
+                TCP,
+                srv,
+                me,
+                80,
+                5008,
+                0x18,
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n",
+            ),
+            false,
+        );
+        assert_eq!(k, Content::Plain("HTTP"));
+        let (k, info) = run(ipv4(TCP, srv, me, 80, 5008, 0x18, &random), false);
+        assert_eq!(k, Content::Compressed);
+        assert!(info.ends_with("compressed"), "{info}");
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0];
+        gz.extend(&random);
+        let (k, _) = run(ipv4(UDP, me, srv, 5009, 9999, 0, &gz), true);
+        assert_eq!(k, Content::Compressed);
+        assert!(Content::Compressed.unencrypted_data());
     }
 
     #[test]

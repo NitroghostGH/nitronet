@@ -463,8 +463,16 @@ fn capture_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         t.muted,
         &[
             "TLS records and QUIC; every later packet of a connection once it has",
-            "been seen encrypted; ports such as 443, 853, 993 and 22; or bytes that",
-            "look random (high entropy), which also catches compressed data",
+            "been seen to be TLS, QUIC or SSH; ports such as 443, 853, 993 and 22;",
+            "or bytes that look random (high entropy) and aren't one of these:",
+        ],
+    ));
+    out.extend(label(
+        "compressed",
+        t.text,
+        &[
+            "random-looking bytes in an HTTP conversation (a gzip or brotli body),",
+            "or data starting like gzip, zstd or xz. Not encrypted, just packed",
         ],
     ));
     out.extend(label(

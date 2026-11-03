@@ -228,7 +228,7 @@ impl App {
             f.last = p.at;
             match p.content {
                 Content::Empty => f.empty += 1,
-                Content::Binary => f.binary += 1,
+                Content::Binary | Content::Compressed => f.binary += 1,
                 Content::Encrypted(why) => {
                     f.encrypted += 1;
                     f.encrypted_why.get_or_insert(why);

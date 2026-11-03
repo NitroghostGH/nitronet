@@ -3,13 +3,17 @@
 //! Two more cgroup_skb programs (ingress and egress) are attached only while
 //! at least one program is being captured, and detached as soon as none are.
 //! For each packet they check whether its socket belongs to a captured
-//! program, in one of two ways:
+//! program, in one of three ways:
 //!   * the socket's cookie is in `socks`. nitronet fills this from the socket
 //!     table each refresh, which covers sockets that existed before capture
 //!     started and sockets a server accepted.
-//!   * the main map says which program created the socket (its comm), and
-//!     that name is in `comms`. This catches new sockets from their very first
-//!     packet, so even a short-lived `curl` is seen in full.
+//!   * the main map says which thread created the socket (its comm), and
+//!     that name is in `comms`. This catches a new process from its very
+//!     first packet, so even a short-lived `curl` is seen in full.
+//!   * the main map says which process created it, and that pid is in
+//!     `pids` (every running process with a captured name). This catches new
+//!     sockets made by a thread with a different name, like Firefox's
+//!     "Socket Thread", from their first packet too.
 //!
 //! A matching packet's first SNAP bytes (from the IP header on) are copied
 //! into a ring buffer, which a reader thread drains. Packets from any other
@@ -66,9 +70,11 @@ pub struct RawPacket {
 pub struct Capture {
     socks: OwnedFd,
     comms: OwnedFd,
+    pids: OwnedFd,
     drops: OwnedFd,
     cur_socks: HashSet<u64>,
     cur_comms: HashSet<[u8; 16]>,
+    cur_pids: HashSet<u32>,
     queue: Arc<Mutex<VecDeque<RawPacket>>>,
     /// Packets dropped because nitronet's queue was full.
     lost: Arc<AtomicU64>,
@@ -83,12 +89,14 @@ impl Capture {
     pub(super) fn start(main: &OwnedFd) -> io::Result<Self> {
         let socks = new_map(BPF_MAP_TYPE_HASH, 8, 1, 16384, "nn_cap_socks")?;
         let comms = new_map(BPF_MAP_TYPE_HASH, 16, 1, 256, "nn_cap_comms")?;
+        let pids = new_map(BPF_MAP_TYPE_HASH, 4, 1, 4096, "nn_cap_pids")?;
         let drops = new_map(BPF_MAP_TYPE_ARRAY, 4, 8, 1, "nn_cap_drops")?;
         let ring = new_map(BPF_MAP_TYPE_RINGBUF, 0, 0, RING, "nn_cap_ring")?;
         let maps = Maps {
             main: main.as_raw_fd(),
             socks: socks.as_raw_fd(),
             comms: comms.as_raw_fd(),
+            pids: pids.as_raw_fd(),
             drops: drops.as_raw_fd(),
             ring: ring.as_raw_fd(),
         };
@@ -120,9 +128,11 @@ impl Capture {
         let mut cap = Self {
             socks,
             comms,
+            pids,
             drops,
             cur_socks: HashSet::new(),
             cur_comms: HashSet::new(),
+            cur_pids: HashSet::new(),
             queue,
             lost,
             stop,
@@ -139,30 +149,25 @@ impl Capture {
         Ok(cap)
     }
 
-    /// Sets what to capture: program names (as in /proc/<pid>/comm) and the
-    /// cookies of their current sockets. Only the differences are written.
-    pub fn set_targets(&mut self, names: &HashSet<String>, cookies: &HashSet<u64>) {
+    /// Sets what to capture: program names (as in /proc/<pid>/comm), the
+    /// pids of the processes with those names, and the cookies of their
+    /// current sockets. Only the differences are written.
+    pub fn set_targets(
+        &mut self,
+        names: &HashSet<String>,
+        pids: &HashSet<u32>,
+        cookies: &HashSet<u64>,
+    ) {
         let comms: HashSet<[u8; 16]> = names.iter().map(|n| comm_key(n)).collect();
-        for c in self.cur_comms.difference(&comms) {
-            map_delete(&self.comms, c);
-        }
-        for c in comms.difference(&self.cur_comms) {
-            let _ = map_update(&self.comms, c, &[1]);
-        }
-        self.cur_comms = comms;
-
-        for c in self.cur_socks.difference(cookies) {
-            map_delete(&self.socks, &c.to_ne_bytes());
-        }
-        let mut added = HashSet::new();
-        for c in cookies.difference(&self.cur_socks) {
-            // A full map just means some old sockets go uncaptured.
-            if map_update(&self.socks, &c.to_ne_bytes(), &[1]).is_ok() {
-                added.insert(*c);
-            }
-        }
-        self.cur_socks.retain(|c| cookies.contains(c));
-        self.cur_socks.extend(added);
+        sync(&self.comms, &mut self.cur_comms, &comms, |c| c.to_vec());
+        // pid 0 marks sockets created before nitronet started.
+        let pids: HashSet<u32> = pids.iter().copied().filter(|&p| p != 0).collect();
+        sync(&self.pids, &mut self.cur_pids, &pids, |p| {
+            p.to_ne_bytes().to_vec()
+        });
+        sync(&self.socks, &mut self.cur_socks, cookies, |c| {
+            c.to_ne_bytes().to_vec()
+        });
     }
 
     /// Takes the packets captured since the last call, oldest first.
@@ -193,6 +198,26 @@ impl Drop for Capture {
     }
 }
 
+/// Makes the set map `map` (recorded in `cur`) hold the keys in `want`. A
+/// full map just means some keys are missing, so failed inserts are skipped
+/// and tried again next time.
+fn sync<K: Copy + Eq + std::hash::Hash>(
+    map: &OwnedFd,
+    cur: &mut HashSet<K>,
+    want: &HashSet<K>,
+    bytes: impl Fn(&K) -> Vec<u8>,
+) {
+    for k in cur.difference(want) {
+        map_delete(map, &bytes(k));
+    }
+    cur.retain(|k| want.contains(k));
+    for k in want {
+        if !cur.contains(k) && map_update(map, &bytes(k), &[1]).is_ok() {
+            cur.insert(*k);
+        }
+    }
+}
+
 /// /proc/<pid>/comm and the kernel's task comm are the same 15 bytes plus a NUL.
 fn comm_key(name: &str) -> [u8; 16] {
     let mut k = [0u8; 16];
@@ -208,6 +233,7 @@ struct Maps {
     main: RawFd,
     socks: RawFd,
     comms: RawFd,
+    pids: RawFd,
     drops: RawFd,
     ring: RawFd,
 }
@@ -227,12 +253,19 @@ fn capture_prog(m: &Maps, outgoing: bool) -> Vec<Insn> {
     // Is this socket on the list?
     a.lookup(m.socks);
     a.jne(R0, 0, "capture");
-    // Otherwise, was it created by a captured program? key = &entry.comm
+    // Otherwise, was it created by a thread with a captured name? key = &entry.comm
     a.lookup(m.main);
     a.jeq(R0, 0, "out");
+    a.i(mov(R7, R0)); // r7 = entry
     a.i(mov(R2, R0));
     a.i(add_imm(R2, V_COMM as i32));
     a.ld_map(m.comms);
+    a.i(call(FN_MAP_LOOKUP_ELEM));
+    a.jne(R0, 0, "capture");
+    // Or by any thread of a captured process? key = &entry.pid
+    a.i(mov(R2, R7));
+    a.i(add_imm(R2, V_PID as i32));
+    a.ld_map(m.pids);
     a.i(call(FN_MAP_LOOKUP_ELEM));
     a.jeq(R0, 0, "out");
 
@@ -459,6 +492,7 @@ mod tests {
             main: 3,
             socks: 4,
             comms: 5,
+            pids: 8,
             drops: 6,
             ring: 7,
         };
@@ -521,7 +555,7 @@ mod tests {
         };
         // By name: a socket created by a thread whose comm is on the list.
         let names = HashSet::from(["nn_cap_test".to_string()]);
-        cap.set_targets(&names, &HashSet::from([cookie]));
+        cap.set_targets(&names, &HashSet::new(), &HashSet::from([cookie]));
         old.send_to(b"by-cookie", to).unwrap();
         std::thread::Builder::new()
             .name("nn_cap_test".into())
@@ -536,6 +570,19 @@ mod tests {
         UdpSocket::bind("127.0.0.1:0")
             .unwrap()
             .send_to(b"ignored", to)
+            .unwrap();
+        // By process: with this test's pid on the list, a new socket from a
+        // thread with another name (like Firefox's "Socket Thread").
+        let pids = HashSet::from([std::process::id()]);
+        cap.set_targets(&names, &pids, &HashSet::from([cookie]));
+        std::thread::Builder::new()
+            .name("other thread".into())
+            .spawn(move || {
+                let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                s.send_to(b"by-pid", to).unwrap();
+            })
+            .unwrap()
+            .join()
             .unwrap();
         std::thread::sleep(Duration::from_millis(300));
         let got = cap.take();
@@ -553,6 +600,7 @@ mod tests {
         // which isn't captured.
         assert!(payloads.contains(&(true, "by-cookie".into())));
         assert!(payloads.contains(&(true, "by-name".into())));
+        assert!(payloads.contains(&(true, "by-pid".into())));
         assert!(!payloads.iter().any(|(_, s)| s == "ignored"));
         assert!(
             got.iter()

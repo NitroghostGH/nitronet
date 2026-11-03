@@ -1,7 +1,7 @@
 //! Reads /proc and /sys with std only: maps socket inodes to processes, finds
 //! systemd units, and reads interface counters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
@@ -67,6 +67,19 @@ pub fn scan() -> ProcMap {
         }
     }
     map
+}
+
+/// The pids of every running process whose name (comm) is in `names`.
+pub fn pids_named(names: &HashSet<String>) -> HashSet<u32> {
+    let Ok(dir) = fs::read_dir("/proc") else {
+        return HashSet::new();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|c| names.contains(c.trim_end_matches('\n')))
+        })
+        .collect()
 }
 
 /// Reads a process's name, service and uid. Returns None if it has exited.

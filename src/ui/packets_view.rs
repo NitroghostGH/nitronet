@@ -213,7 +213,7 @@ fn endpoint_line(e: Endpoint, width: usize) -> Line<'static> {
 fn content_style(t: &Theme, c: Content) -> Style {
     match c {
         Content::Plain(_) => t.fg(t.good),
-        Content::Binary => t.fg(t.text),
+        Content::Binary | Content::Compressed => t.fg(t.text),
         Content::Encrypted(_) | Content::Empty => t.muted(),
     }
 }

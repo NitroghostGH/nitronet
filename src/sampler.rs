@@ -114,6 +114,8 @@ pub struct Sampler {
     /// Packet capture, running while any program is chosen for it.
     capture: Option<Capture>,
     capture_names: HashSet<String>,
+    /// Running processes with a captured name, refreshed each sample.
+    capture_pids: HashSet<u32>,
     pending: Vec<Packet>,
     pending_lost: u64,
     next_packet: u64,
@@ -166,6 +168,7 @@ impl Sampler {
             acc: HashMap::new(),
             capture: None,
             capture_names: HashSet::new(),
+            capture_pids: HashSet::new(),
             pending: Vec::new(),
             pending_lost: 0,
             next_packet: 0,
@@ -190,6 +193,9 @@ impl Sampler {
         let now = Instant::now();
         let socks = self.diag.dump_all()?;
         let pm = procfs::scan();
+        if self.capture.is_some() {
+            self.capture_pids = procfs::pids_named(&self.capture_names);
+        }
         let nic = procfs::nic_totals();
         let mut entries = match &self.tracker {
             Some(t) => Some(t.read_all()?),
@@ -379,6 +385,7 @@ impl Sampler {
             self.drain_capture();
             self.capture = None;
             self.capture_names.clear();
+            self.capture_pids.clear();
             return Ok(());
         }
         let Some(tracker) = &self.tracker else {
@@ -401,6 +408,7 @@ impl Sampler {
             );
         }
         self.capture_names = names.clone();
+        self.capture_pids = procfs::pids_named(names);
         self.update_capture_targets();
         Ok(())
     }
@@ -422,7 +430,7 @@ impl Sampler {
             })
             .map(|(c, _)| *c)
             .collect();
-        cap.set_targets(&self.capture_names, &cookies);
+        cap.set_targets(&self.capture_names, &self.capture_pids, &cookies);
     }
 
     /// Captured packets since the last call, oldest first.
@@ -659,6 +667,69 @@ mod live {
                 .info
                 .contains("ClientHello → example.com")
         }));
+        s.set_capture(&HashSet::new()).unwrap();
+    }
+
+    /// The router login case: a program whose connections are opened by a
+    /// differently named thread (Firefox's "Socket Thread") sends a form on
+    /// a brand-new connection, faster than a refresh. The whole exchange must
+    /// be captured, and the form readable.
+    /// sudo -E cargo test live_new_connection -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_new_connection_from_another_thread() {
+        use std::io::{Read, Write};
+        let me = std::fs::read_to_string("/proc/self/comm").unwrap();
+        let me = me.trim_end().to_string();
+        let mut s = Sampler::new(true).unwrap();
+        s.sample().unwrap();
+        s.set_capture(&HashSet::from([me.clone()])).unwrap();
+
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = server.local_addr().unwrap();
+        let client = std::thread::Builder::new()
+            .name("Socket Thread".into())
+            .spawn(move || {
+                let mut c = std::net::TcpStream::connect(to).unwrap();
+                c.write_all(b"POST /login HTTP/1.1\r\nHost: router\r\nContent-Length: 30\r\n\r\n")
+                    .unwrap();
+                c.write_all(b"username=admin&password=hunter2").unwrap();
+                let mut buf = [0u8; 64];
+                let _ = c.read(&mut buf);
+            })
+            .unwrap();
+        let (mut conn, _) = server.accept().unwrap();
+        let mut buf = [0u8; 256];
+        let _ = conn.read(&mut buf);
+        conn.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        client.join().unwrap();
+        drop(conn);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        s.sample().unwrap();
+        let pk = s.take_packets();
+        for p in &pk {
+            eprintln!(
+                "{} {} {} [{}]",
+                p.program,
+                if p.outgoing { "→" } else { "←" },
+                p.head.as_ref().unwrap().info,
+                p.content.label()
+            );
+        }
+        let has = |what: &str| {
+            pk.iter().any(|p| {
+                p.outgoing
+                    && p.content.unencrypted_data()
+                    && String::from_utf8_lossy(p.payload()).contains(what)
+            })
+        };
+        assert!(
+            pk.iter()
+                .any(|p| p.head.as_ref().unwrap().info.starts_with("[S]")),
+            "the first SYN is missing"
+        );
+        assert!(has("POST /login") && has("password=hunter2"));
         s.set_capture(&HashSet::new()).unwrap();
     }
 }
