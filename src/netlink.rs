@@ -418,6 +418,54 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
 mod tests {
     use super::*;
 
+    /// An inet_diag_msg for 127.0.0.1:8080 ⇄ 127.0.0.1:40000, uid 1000,
+    /// with a tcp_info attribute when `tcp` is given (acked, received).
+    fn diag_msg(tcp: Option<(u64, u64)>) -> Vec<u8> {
+        let mut m = vec![0u8; MSG_LEN];
+        m[0] = libc::AF_INET as u8;
+        m[1] = 1; // ESTABLISHED
+        m[4..6].copy_from_slice(&8080u16.to_be_bytes());
+        m[6..8].copy_from_slice(&40000u16.to_be_bytes());
+        m[8..12].copy_from_slice(&[127, 0, 0, 1]);
+        m[24..28].copy_from_slice(&[127, 0, 0, 1]);
+        m[44..48].copy_from_slice(&0xdead_beefu32.to_ne_bytes());
+        m[48..52].copy_from_slice(&7u32.to_ne_bytes());
+        m[64..68].copy_from_slice(&1000u32.to_ne_bytes());
+        m[68..72].copy_from_slice(&4242u32.to_ne_bytes());
+        if let Some((acked, received)) = tcp {
+            let mut info = vec![0u8; TCPI_BYTES_RECEIVED + 8];
+            info[TCPI_BYTES_ACKED..TCPI_BYTES_ACKED + 8].copy_from_slice(&acked.to_ne_bytes());
+            info[TCPI_BYTES_RECEIVED..].copy_from_slice(&received.to_ne_bytes());
+            m.extend_from_slice(&((4 + info.len()) as u16).to_ne_bytes());
+            m.extend_from_slice(&INET_DIAG_INFO.to_ne_bytes());
+            m.extend_from_slice(&info);
+        }
+        m
+    }
+
+    #[test]
+    fn parses_socket_messages() {
+        let s = parse_msg(Proto::Tcp, &diag_msg(Some((300, 5000)))).unwrap();
+        assert_eq!(s.local, "127.0.0.1:8080".parse().unwrap());
+        assert_eq!(s.remote, "127.0.0.1:40000".parse().unwrap());
+        assert_eq!((s.state, s.uid, s.inode), (1, 1000, 4242));
+        assert_eq!(s.cookie, 7 << 32 | 0xdead_beef);
+        assert_eq!((s.bytes_out, s.bytes_in), (Some(300), Some(5000)));
+        // No tcp_info (UDP): no byte counts.
+        let s = parse_msg(Proto::Udp, &diag_msg(None)).unwrap();
+        assert_eq!((s.bytes_out, s.bytes_in), (None, None));
+        // Short, or an attribute claiming more than there is: no panic.
+        assert!(parse_msg(Proto::Tcp, &diag_msg(None)[..MSG_LEN - 1]).is_none());
+        let mut bad = diag_msg(Some((1, 2)));
+        bad[MSG_LEN..MSG_LEN + 2].copy_from_slice(&u16::MAX.to_ne_bytes());
+        let s = parse_msg(Proto::Tcp, &bad).unwrap();
+        assert_eq!(s.bytes_in, None);
+        // An unknown address family isn't a socket we can show.
+        let mut odd = diag_msg(None);
+        odd[0] = 99;
+        assert!(parse_msg(Proto::Tcp, &odd).is_none());
+    }
+
     #[test]
     fn parses_neighbor_messages() {
         let mut m = vec![0u8; NDMSG_LEN];

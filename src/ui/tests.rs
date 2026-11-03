@@ -1608,3 +1608,47 @@ fn r_reverses_only_the_list_on_screen() {
     key(&mut a, KeyCode::Char('s'));
     assert!(!a.reverse.procs && a.reverse.flows);
 }
+
+#[test]
+fn history_aligns_owners_and_forgets_silent_ones() {
+    use super::{HISTORY, History};
+    let mut h = History::default();
+    let mut snap = fixture(0);
+    snap.nic_rate = Some((10.0, 1.0));
+    let row = |pid: u32, rate: f64| ProcRow {
+        owner: Owner::Pid(pid),
+        name: format!("p{pid}"),
+        unit: None,
+        user: "nitro".into(),
+        uid: Some(1000),
+        alive: true,
+        rate_in: rate,
+        rate_out: 0.0,
+        total_in: 0,
+        total_out: 0,
+        sockets: 1,
+        listening: vec![],
+    };
+    // Program 1 runs throughout; program 2 starts at the third sample.
+    for k in 0..5 {
+        snap.procs = vec![row(1, 1.0)];
+        if k >= 2 {
+            snap.procs.push(row(2, 2.0));
+        }
+        h.push(&snap);
+    }
+    assert_eq!(h.total_in.len(), 5);
+    assert_eq!(h.peak, (10.0, 1.0));
+    // Summed and aligned at the newest sample.
+    let (inn, _) = h.series(&[Owner::Pid(1), Owner::Pid(2)]);
+    assert_eq!(inn, vec![1.0, 1.0, 3.0, 3.0, 3.0]);
+
+    // A full window of silence forgets an owner; the series stay capped.
+    snap.procs = vec![row(1, 1.0)];
+    for _ in 0..HISTORY {
+        h.push(&snap);
+    }
+    assert_eq!(h.total_in.len(), HISTORY);
+    assert_eq!(h.series(&[Owner::Pid(2)]).0.len(), 0);
+    assert_eq!(h.series(&[Owner::Pid(1)]).0.len(), HISTORY);
+}

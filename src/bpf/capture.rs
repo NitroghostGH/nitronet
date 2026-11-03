@@ -509,6 +509,80 @@ fn parse_record(rec: &[u8], now: SystemTime, mono_now: u64) -> Option<RawPacket>
 mod tests {
     use super::*;
 
+    /// A ring laid out like the kernel's (consumer page, producer page, data),
+    /// in anonymous memory, without the data area's double mapping.
+    fn fake_ring() -> Ring {
+        // SAFETY: sysconf has no preconditions.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let anon = |len: usize| {
+            // SAFETY: a fresh private anonymous mapping.
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(p, libc::MAP_FAILED);
+            p as *mut u8
+        };
+        Ring {
+            fd: OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+            consumer: anon(page),
+            producer: anon(page + 2 * RING as usize),
+            page,
+        }
+    }
+
+    /// Writes a record header and data at ring position `pos`; returns the next.
+    fn put(r: &Ring, pos: u64, word: u32, data: &[u8]) -> u64 {
+        // SAFETY: pos is inside the data area, which follows the producer page.
+        unsafe {
+            let at = r.producer.add(r.page + pos as usize);
+            (at as *mut u32).write(word);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), at.add(8), data.len());
+        }
+        pos + ((data.len() as u64 + 8 + 7) & !7)
+    }
+
+    fn positions(r: &Ring) -> (u64, u64) {
+        // SAFETY: both pages start with an aligned u64.
+        unsafe { (*(r.consumer as *const u64), *(r.producer as *const u64)) }
+    }
+
+    fn set_producer(r: &Ring, pos: u64) {
+        // SAFETY: as above; the fake producer page is writable.
+        unsafe { (r.producer as *mut u64).write(pos) };
+    }
+
+    #[test]
+    fn ring_reader_skips_discarded_and_stops_at_busy_or_corrupt() {
+        let r = fake_ring();
+        // put returns where the next record starts.
+        let two = put(&r, 0, 3, b"one");
+        let three = put(&r, two, RINGBUF_DISCARD | 3, b"two");
+        let four = put(&r, three, 5, b"three");
+        let end = put(&r, four, RINGBUF_BUSY | 4, b"four");
+        set_producer(&r, end);
+        let mut got = Vec::new();
+        r.drain(|rec| got.push(rec.to_vec()));
+        assert_eq!(got, vec![b"one".to_vec(), b"three".to_vec()]);
+        // Stopped at the record still being written.
+        assert_eq!(positions(&r).0, four);
+
+        // A length the program can't produce: stop there rather than read it.
+        let r = fake_ring();
+        let a = put(&r, 0, 2, b"ok");
+        let end = put(&r, a, RECORD as u32 + 1, b"bad");
+        set_producer(&r, end);
+        let mut n = 0;
+        r.drain(|_| n += 1);
+        assert_eq!((n, positions(&r).0), (1, a));
+    }
+
     #[test]
     fn program_jumps_resolve_and_end_in_allow() {
         let m = Maps {
