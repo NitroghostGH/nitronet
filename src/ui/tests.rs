@@ -1250,7 +1250,7 @@ fn c_toggles_capture_on_processes() {
     let mut a = app();
     a.packets.clear();
     a.snap.source = Source::TcpInfo {
-        reason: "eBPF needs root".into(),
+        reason: crate::sampler::NoEbpf::NotRoot,
     };
     key(&mut a, KeyCode::Char('4'));
     let text = buffer_text(&render(&mut a, 180, 46));

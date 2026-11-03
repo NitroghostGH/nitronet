@@ -55,7 +55,7 @@ impl Packet {
 
     /// The application-level part of the info ("TLS ClientHello → x"), if any.
     pub fn app_info(&self) -> Option<&str> {
-        self.head.as_ref()?.info.split_once("  ").map(|(_, a)| a)
+        self.head.as_ref()?.app()
     }
 
     /// The connection this packet belongs to, for grouping into conversations.
@@ -158,11 +158,38 @@ pub struct Decoded {
     pub payload_at: usize,
     /// Payload length on the wire.
     pub payload_len: usize,
-    /// One-line description, e.g. "[S.] seq 0" or "DNS A? example.com".
+    /// One-line description, e.g. "[S.] seq 0" or "len 40  DNS A? example.com":
+    /// the transport part, then (from `app_at`) what the payload is.
     pub info: String,
+    /// Where the application part of `info` starts, if there is one.
+    app_at: Option<usize>,
+    /// A later fragment of a fragmented IP packet: no transport header.
+    pub fragment: bool,
 }
 
 impl Decoded {
+    /// The transport part of `info`: flags, length, ICMP type.
+    pub fn transport_info(&self) -> &str {
+        match self.app_at {
+            Some(at) => self.info[..at].trim_end(),
+            None => &self.info,
+        }
+    }
+
+    /// The application part of `info` ("TLS ClientHello → x"), if any.
+    pub fn app(&self) -> Option<&str> {
+        self.info.get(self.app_at?..)
+    }
+
+    /// Adds what the payload is to `info`, unless something already said.
+    pub fn set_app(&mut self, app: &str) {
+        if self.app_at.is_none() {
+            self.info.push_str("  ");
+            self.app_at = Some(self.info.len());
+            self.info.push_str(app);
+        }
+    }
+
     pub fn proto(&self) -> &'static str {
         match (&self.l4, self.version) {
             (L4::Tcp { .. }, _) => "TCP",
@@ -246,6 +273,8 @@ pub fn decode(data: &[u8], wire_len: u32) -> Option<Decoded> {
         payload_at: at,
         payload_len: wire.saturating_sub(at),
         info: String::new(),
+        app_at: None,
+        fragment,
     };
     if fragment {
         d.info = "fragment".into();
@@ -274,8 +303,7 @@ pub fn decode(data: &[u8], wire_len: u32) -> Option<Decoded> {
                 d.info.push_str(&format!(" len {}", d.payload_len));
             }
             if let Some(app) = tcp_app(payload, d.sport, d.dport) {
-                d.info.push_str("  ");
-                d.info.push_str(&app);
+                d.set_app(&app);
             }
         }
         UDP if l4.len() >= 8 => {
@@ -287,7 +315,7 @@ pub fn decode(data: &[u8], wire_len: u32) -> Option<Decoded> {
             let payload = data.get(d.payload_at..).unwrap_or_default();
             d.info = format!("len {}", d.payload_len);
             if let Some(app) = udp_app(payload, be16(0), be16(2)) {
-                d.info = format!("len {}  {app}", d.payload_len);
+                d.set_app(&app);
             }
         }
         ICMP | ICMP6 if l4.len() >= 4 => {
@@ -679,11 +707,8 @@ impl Classifier {
             Content::Compressed => Some("compressed".to_string()),
             _ => None,
         };
-        if let (Some(extra), Some(d)) = (preview, p.head.as_mut())
-            && !d.info.contains("  ")
-        {
-            d.info.push_str("  ");
-            d.info.push_str(&extra);
+        if let (Some(extra), Some(d)) = (preview, p.head.as_mut()) {
+            d.set_app(&extra);
         }
     }
 
@@ -701,7 +726,7 @@ impl Classifier {
         if matches!(d.l4, L4::Icmp { .. }) {
             return Content::Plain("ICMP");
         }
-        if d.payload_len == 0 || d.info == "fragment" {
+        if d.payload_len == 0 || d.fragment {
             return Content::Empty;
         }
         let payload = p.payload();
@@ -1342,6 +1367,22 @@ pub(crate) mod tests {
         let mut p = tcp(8080, b"Please login to continue, then pass go\r\n");
         c.apply(&mut p);
         assert_eq!(p.secret, None);
+    }
+
+    #[test]
+    fn info_keeps_transport_and_payload_apart() {
+        // Two spaces inside the payload's own text don't confuse the split.
+        let get = b"GET /a  b HTTP/1.1\r\n\r\n";
+        let p = ipv4(TCP, [10, 0, 0, 1], [10, 0, 0, 2], 40000, 80, 0x18, get);
+        let mut d = decode(&p, p.len() as u32).unwrap();
+        assert_eq!(d.transport_info(), format!("[P.] len {}", get.len()));
+        assert_eq!(d.app(), Some("GET /a  b HTTP/1.1"));
+        // Only the first description sticks.
+        d.set_app("text");
+        assert_eq!(d.app(), Some("GET /a  b HTTP/1.1"));
+        let p = ipv4(TCP, [10, 0, 0, 1], [10, 0, 0, 2], 40000, 80, 0x10, b"");
+        let d = decode(&p, p.len() as u32).unwrap();
+        assert_eq!((d.transport_info(), d.app()), ("[.]", None));
     }
 
     #[test]

@@ -166,10 +166,7 @@ fn draw_header(app: &mut App, f: &mut Frame, area: Rect) {
     }
     let mut bottom_right = Vec::new();
     if let Source::TcpInfo { reason } = &s.source {
-        bottom_right.push(Span::styled(
-            format!(" {} ", reason.lines().next().unwrap_or_default()),
-            t.fg(t.warn),
-        ));
+        bottom_right.push(Span::styled(format!(" {} ", reason.short()), t.fg(t.warn)));
     }
     if !s.is_root && s.hidden_procs > 0 {
         bottom_right.push(Span::styled(

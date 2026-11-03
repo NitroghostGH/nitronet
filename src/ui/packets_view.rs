@@ -131,8 +131,8 @@ fn status_line(app: &App, shown: usize, what: &str) -> Line<'static> {
 }
 
 fn empty_text(app: &App, what: &str) -> String {
-    if !matches!(app.snap.source, Source::Ebpf { .. }) {
-        "capturing packets needs eBPF: run nitronet as root".to_string()
+    if let Source::TcpInfo { reason } = &app.snap.source {
+        reason.capture_hint()
     } else if !app.filter.is_empty() {
         empty_message(app, what)
     } else if !app.packets.is_empty() {
@@ -235,16 +235,16 @@ fn pkt_cells(t: &Theme, p: &Packet) -> Vec<Cell<'static>> {
     } else {
         Span::styled("←", t.fg(t.rx))
     };
-    let (proto, info) = match &p.head {
+    let proto = match &p.head {
         Some(d) => {
             let color = match d.l4 {
                 L4::Tcp { .. } => t.fg(t.tcp),
                 L4::Udp => t.fg(t.udp),
                 _ => t.fg(t.text),
             };
-            (Span::styled(d.proto(), color), d.info.clone())
+            Span::styled(d.proto(), color)
         }
-        None => (Span::styled("?", t.faint()), "unreadable header".into()),
+        None => Span::styled("?", t.faint()),
     };
     let (local, remote) = match p.ends() {
         Some((l, r)) => (endpoint_line(l, 22), endpoint_line(r, 30)),
@@ -258,25 +258,37 @@ fn pkt_cells(t: &Theme, p: &Packet) -> Vec<Cell<'static>> {
         Cell::from(remote),
         Cell::from(local),
         Cell::from(Line::from(Span::styled(p.len.to_string(), t.muted())).right_aligned()),
-        Cell::from(info_line(t, &info, p.content, p.secret.is_some())),
+        Cell::from(info_line(t, p, usize::MAX)),
     ]
 }
 
 /// The info column. The part after two spaces says what the payload is, and
 /// is green when it's readable, dim when encrypted. A login sent in clear
 /// gets a warning sign in front.
-fn info_line(t: &Theme, info: &str, content: Content, secret: bool) -> Line<'static> {
+/// At most `room` columns, not counting the warning sign.
+fn info_line(t: &Theme, p: &Packet, room: usize) -> Line<'static> {
     let mut spans = Vec::new();
-    if secret {
+    if p.secret.is_some() {
         spans.push(Span::styled("⚠ ", t.fg(t.bad).add_modifier(Modifier::BOLD)));
     }
-    match info.split_once("  ") {
-        Some((head, app)) => {
-            spans.push(Span::styled(head.to_string(), t.muted()));
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(app.to_string(), content_style(t, content)));
-        }
-        None => spans.push(Span::styled(info.to_string(), t.muted())),
+    let Some(d) = &p.head else {
+        spans.push(Span::styled(
+            elide_end("unreadable header", room),
+            t.faint(),
+        ));
+        return Line::from(spans);
+    };
+    let head = d.transport_info();
+    spans.push(Span::styled(elide_end(head, room), t.muted()));
+    let left = room.saturating_sub(head.chars().count() + 2);
+    if let Some(app) = d.app()
+        && left > 0
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            elide_end(app, left),
+            content_style(t, p.content),
+        ));
     }
     Line::from(spans)
 }
@@ -849,7 +861,6 @@ fn draw_flow_timeline(app: &App, f: &mut Frame, area: Rect, fl: &Flow) {
         } else {
             Span::styled(" ← ", t.fg(t.rx))
         };
-        let info = p.head.as_ref().map_or("?", |d| d.info.as_str());
         let used = 7 + 3 + 6;
         let mut spans = vec![
             Span::styled(format!("{since:>7}"), t.faint()),
@@ -857,7 +868,7 @@ fn draw_flow_timeline(app: &App, f: &mut Frame, area: Rect, fl: &Flow) {
             Span::styled(format!("{:>5} ", p.len), t.muted()),
         ];
         let room = w.saturating_sub(used + if p.secret.is_some() { 2 } else { 0 });
-        spans.extend(info_line(t, &elide_end(info, room), p.content, p.secret.is_some()).spans);
+        spans.extend(info_line(t, p, room).spans);
         out.push(Line::from(spans));
     }
     if shown < pkts.len() {

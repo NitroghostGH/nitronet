@@ -43,8 +43,51 @@ pub enum Source {
     },
     TcpInfo {
         /// Why eBPF isn't in use.
-        reason: String,
+        reason: NoEbpf,
     },
+}
+
+/// Why eBPF isn't in use.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NoEbpf {
+    NotRoot,
+    /// --no-ebpf
+    Disabled,
+    /// It failed to load or attach. The error may include the verifier log.
+    Failed(String),
+}
+
+impl NoEbpf {
+    /// The first line, for a status bar.
+    pub fn short(&self) -> String {
+        self.to_string()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Why packets can't be captured, and what to do about it.
+    pub fn capture_hint(&self) -> String {
+        match self {
+            NoEbpf::NotRoot => "capturing packets needs eBPF: run nitronet as root".into(),
+            NoEbpf::Disabled => "capturing packets needs eBPF, which --no-ebpf turned off".into(),
+            NoEbpf::Failed(_) => format!(
+                "capturing packets needs eBPF, which isn't running ({})",
+                self.short()
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for NoEbpf {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            NoEbpf::NotRoot => write!(f, "eBPF needs root"),
+            NoEbpf::Disabled => write!(f, "disabled with --no-ebpf"),
+            NoEbpf::Failed(e) => write!(f, "eBPF unavailable: {e}"),
+        }
+    }
 }
 
 pub struct SockRow {
@@ -141,7 +184,7 @@ impl Sampler {
             (
                 None,
                 Source::TcpInfo {
-                    reason: "disabled with --no-ebpf".into(),
+                    reason: NoEbpf::Disabled,
                 },
             )
         } else {
@@ -153,13 +196,13 @@ impl Sampler {
                 Err(e) if e.kind() == io::ErrorKind::PermissionDenied => (
                     None,
                     Source::TcpInfo {
-                        reason: "eBPF needs root".into(),
+                        reason: NoEbpf::NotRoot,
                     },
                 ),
                 Err(e) => (
                     None,
                     Source::TcpInfo {
-                        reason: format!("eBPF unavailable: {e}"),
+                        reason: NoEbpf::Failed(e.to_string()),
                     },
                 ),
             }
@@ -407,13 +450,7 @@ impl Sampler {
         }
         let Some(tracker) = &self.tracker else {
             return Err(match &self.source {
-                Source::TcpInfo { reason } if reason == "eBPF needs root" => {
-                    "capturing packets needs eBPF: run nitronet as root".to_string()
-                }
-                Source::TcpInfo { reason } => format!(
-                    "capturing packets needs eBPF, which isn't running ({})",
-                    reason.lines().next().unwrap_or_default()
-                ),
+                Source::TcpInfo { reason } => reason.capture_hint(),
                 Source::Ebpf { .. } => "eBPF isn't running".to_string(),
             });
         };

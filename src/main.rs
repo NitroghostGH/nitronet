@@ -88,8 +88,9 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
     let mut sampler = Sampler::new(args.ebpf)?;
     // A failure other than missing permissions is worth showing in full (it may include the verifier log).
-    if let Source::TcpInfo { reason } = sampler.source()
-        && reason.starts_with("eBPF unavailable")
+    if let Source::TcpInfo {
+        reason: reason @ sampler::NoEbpf::Failed(_),
+    } = sampler.source()
     {
         eprintln!("nitronet: {reason}\nnitronet: falling back to tcp_info (TCP only)");
     }
@@ -120,10 +121,7 @@ fn print_report(s: &sampler::Snapshot) {
         Source::Ebpf {
             tracks_creators: false,
         } => "eBPF, TCP+UDP, no creator tracking".to_string(),
-        Source::TcpInfo { reason } => format!(
-            "tcp_info, TCP only: {}",
-            reason.lines().next().unwrap_or_default()
-        ),
+        Source::TcpInfo { reason } => format!("tcp_info, TCP only: {}", reason.short()),
     };
     println!(
         "seen down {}/s  up {}/s  ({} sockets, {} closed during sample; {source})",
