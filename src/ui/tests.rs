@@ -314,12 +314,167 @@ pub(crate) fn fixture(k: usize) -> Snapshot {
     }
 }
 
-/// An app with 300 samples of history.
+/// A scanned home network. 192.168.0.31 is the peer of the fixture's
+/// syncthing and sshd connections, so its detail pane shows traffic.
+pub(crate) fn lan_fixture() -> crate::lan::LanState {
+    use crate::lan::discover::Iface;
+    use crate::lan::{LanState, Method, test_device};
+    use std::net::Ipv4Addr;
+    use std::time::Instant;
+
+    let ip = |d: u8| Ipv4Addr::new(192, 168, 0, d);
+    let ago = |s: u64| {
+        Instant::now()
+            .checked_sub(Duration::from_secs(s))
+            .unwrap_or_else(Instant::now)
+    };
+    let mut s = LanState {
+        iface: Some(Iface {
+            name: "eno1".into(),
+            index: 2,
+            ip: ip(74),
+            prefix: 24,
+            mac: Some([0x30, 0xc5, 0x99, 0xaa, 0xbb, 0x02]),
+            gateway: Some(ip(1)),
+            ipv6: vec![
+                ("2001:db8:322e:0:32c5:99ff:feaa:bb02".parse().unwrap(), 64),
+                ("fe80::32c5:99ff:feaa:bb02".parse().unwrap(), 64),
+            ],
+            first: ip(1),
+            count: 254,
+            truncated: false,
+        }),
+        method: Some(Method::Arp),
+        scans: 4,
+        last_scan: Some(ago(12)),
+        vendors_available: true,
+        ..LanState::default()
+    };
+    let mut add = |d: crate::lan::Device| {
+        s.devices.insert(d.key, d);
+    };
+    let v6 = |a: &str| -> std::net::Ipv6Addr { a.parse().unwrap() };
+    let mut gw = test_device(
+        ip(1),
+        Some([0x1c, 0x61, 0xb4, 0xaa, 0xbb, 0x01]),
+        None,
+        Some("TP-Link Systems"),
+    );
+    gw.is_gateway = true;
+    gw.ipv6 = vec![
+        v6("2001:db8:322e:0:1e61:b4ff:feaa:bb01"),
+        v6("fe80::1e61:b4ff:feaa:bb01"),
+    ];
+    add(gw);
+    let mut nas = test_device(
+        ip(20),
+        Some([0x00, 0x11, 0x32, 0xaa, 0xbb, 0x07]),
+        Some("nas.lan"),
+        Some("Synology"),
+    );
+    nas.ports = Some(vec![22, 80, 443, 445, 5000]);
+    nas.ipv6 = vec![
+        v6("2001:db8:322e:0:211:32ff:feaa:bb07"),
+        v6("fd00::20"),
+        v6("fe80::211:32ff:feaa:bb07"),
+    ];
+    add(nas);
+    add(test_device(
+        ip(31),
+        Some([0x3c, 0x22, 0xfb, 0x10, 0x20, 0x30]),
+        Some("laptop.local"),
+        Some("Apple"),
+    ));
+    let mut pi = test_device(
+        ip(42),
+        Some([0xdc, 0xa6, 0x32, 0x01, 0x02, 0x03]),
+        Some("pihole.lan"),
+        Some("Raspberry Pi Trading"),
+    );
+    pi.new = true;
+    add(pi);
+    add(test_device(
+        ip(71),
+        Some([0x08, 0x36, 0xc9, 0xaa, 0xbb, 0x05]),
+        None,
+        Some("NETGEAR"),
+    ));
+    let mut me = test_device(
+        ip(74),
+        Some([0x30, 0xc5, 0x99, 0xaa, 0xbb, 0x02]),
+        Some("desktop"),
+        Some("ASUSTek COMPUTER"),
+    );
+    me.is_self = true;
+    me.ipv6 = vec![
+        v6("2001:db8:322e:0:32c5:99ff:feaa:bb02"),
+        v6("fe80::32c5:99ff:feaa:bb02"),
+    ];
+    me.rtt = None;
+    add(me);
+    let mut printer = test_device(
+        ip(90),
+        Some([0x3c, 0x2a, 0xf4, 0x55, 0x66, 0x77]),
+        Some("HP-LaserJet.local"),
+        Some("Brother Industries"),
+    );
+    printer.probing = true;
+    add(printer);
+    add(test_device(
+        ip(155),
+        Some([0xd6, 0xfa, 0xc4, 0xaa, 0xbb, 0x04]),
+        None,
+        None,
+    ));
+    add(test_device(
+        ip(156),
+        Some([0x58, 0x24, 0x29, 0xaa, 0xbb, 0x06]),
+        Some("Living-Room.local"),
+        Some("Google"),
+    ));
+    add(test_device(
+        ip(226),
+        Some([0xc8, 0x4a, 0xa0, 0xaa, 0xbb, 0x03]),
+        Some("PS5-AABB03.local"),
+        Some("Sony Interactive Entertainment"),
+    ));
+    // A phone seen only over IPv6.
+    let mut phone = test_device(
+        ip(0),
+        Some([0x7a, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        None,
+        None,
+    );
+    phone.ipv4 = None;
+    phone.ipv6 = vec![
+        v6("2001:db8:322e:0:9c1:5e2d:aa10:7b3c"),
+        v6("fe80::781f:22ff:fe33:4455"),
+    ];
+    add(phone);
+    let mut old = test_device(
+        ip(240),
+        Some([0xa4, 0x83, 0xe7, 0x00, 0x00, 0x01]),
+        Some("old-tablet.local"),
+        Some("Apple"),
+    );
+    old.online = false;
+    old.last_seen = ago(7 * 60);
+    add(old);
+    s.devices_v6 = s
+        .devices
+        .values()
+        .filter(|d| d.online && !d.ipv6.is_empty())
+        .count();
+    s
+}
+
+/// An app with 300 samples of history and a scanned LAN.
 fn app() -> App {
     let mut app = App::new(fixture(0), Duration::from_secs(1));
     for k in 1..300 {
         app.set_snapshot(fixture(k));
     }
+    app.lan_state = lan_fixture();
     app
 }
 
@@ -366,11 +521,19 @@ fn renders_everywhere() {
         render(&mut a, w, h);
         key(&mut a, KeyCode::Char('l'));
         render(&mut a, w, h);
+        key(&mut a, KeyCode::Char('3'));
+        render(&mut a, w, h);
         key(&mut a, KeyCode::Char('s'));
         render(&mut a, w, h);
         key(&mut a, KeyCode::Char('?'));
         render(&mut a, w, h);
     }
+    // An empty, never-scanned LAN renders its empty state.
+    let mut a = app();
+    a.lan_state = crate::lan::LanState::default();
+    key(&mut a, KeyCode::Char('3'));
+    let text = buffer_text(&render(&mut a, 160, 45));
+    assert!(text.contains("the scanner isn't running"));
 }
 
 #[test]
@@ -514,6 +677,14 @@ fn snapshots() {
         ("help", 180, 46, &[KeyCode::Char('?')]),
         ("medium", 120, 34, &[]),
         ("small", 80, 24, &[]),
+        ("devices", 180, 46, &[KeyCode::Char('3')]),
+        (
+            "devices-peer",
+            180,
+            46,
+            &[KeyCode::Char('3'), KeyCode::Down, KeyCode::Down],
+        ),
+        ("devices-nas", 180, 46, &[KeyCode::Char('3'), KeyCode::Down]),
     ];
     for (name, w, h, keys) in shots {
         let mut a = app();
@@ -638,4 +809,111 @@ fn grouping_keeps_the_selected_program() {
     key(&mut a, KeyCode::Char('g'));
     render(&mut a, 160, 45);
     assert_eq!(selected_name(&a), "claude");
+}
+
+#[test]
+fn devices_tab_lists_sorts_and_follows_selection() {
+    use std::net::Ipv4Addr;
+    let mut a = app();
+    key(&mut a, KeyCode::Char('3'));
+    let text = buffer_text(&render(&mut a, 180, 46));
+    for want in [
+        "Devices 12",
+        "PS5-AABB03.local",
+        "gateway",
+        "this machine",
+        "private address",
+        "eno1",
+        "2001:db8:322e::/64",
+        "IPV6",
+        "…:9c1:5e2d:aa10:7b3c",
+    ] {
+        assert!(text.contains(want), "missing {want:?}");
+    }
+    let ipv4 = |a: &App, k: &crate::lan::DevKey| a.lan_state.devices[k].ipv4;
+    // Default order is by IP; select the Pi (row 3), then sort by name: still the Pi.
+    for _ in 0..3 {
+        key(&mut a, KeyCode::Down);
+    }
+    render(&mut a, 180, 46);
+    let pi = Some(Ipv4Addr::new(192, 168, 0, 42));
+    assert_eq!(ipv4(&a, &a.dev_sel.unwrap()), pi);
+    key(&mut a, KeyCode::Char('s'));
+    render(&mut a, 180, 46);
+    let rows = a.dev_rows();
+    assert_eq!(ipv4(&a, &rows[a.dev_state.selected().unwrap()]), pi);
+    // Name order puts unnamed devices last.
+    let last = rows.last().unwrap();
+    assert!(a.lan_state.devices[last].name.is_none());
+    // Back to IP order: the IPv6-only phone sorts after every IPv4 device.
+    for _ in 0..3 {
+        key(&mut a, KeyCode::Char('s'));
+    }
+    assert_eq!(ipv4(&a, a.dev_rows().last().unwrap()), None);
+
+    // The filter matches vendors...
+    key(&mut a, KeyCode::Char('/'));
+    for c in "sony".chars() {
+        key(&mut a, KeyCode::Char(c));
+    }
+    let rows = a.dev_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(ipv4(&a, &rows[0]), Some(Ipv4Addr::new(192, 168, 0, 226)));
+    // ...and IPv6 addresses.
+    key(&mut a, KeyCode::Esc);
+    key(&mut a, KeyCode::Char('/'));
+    for c in "fd00::".chars() {
+        key(&mut a, KeyCode::Char(c));
+    }
+    let rows = a.dev_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(ipv4(&a, &rows[0]), Some(Ipv4Addr::new(192, 168, 0, 20)));
+}
+
+/// Scans the real network (unprivileged) and writes the Devices tab to
+/// target/snapshots/devices-live.html. It's ignored because it sends packets.
+#[test]
+#[ignore]
+fn live_devices_snapshot() {
+    let mut a = app();
+    a.lan_state = crate::lan::scan_blocking();
+    assert!(
+        a.lan_state.scans > 0,
+        "scan did not finish: {:?}",
+        a.lan_state.error
+    );
+    key(&mut a, KeyCode::Char('3'));
+    // Select this machine.
+    a.dev_sel = a
+        .lan_state
+        .devices
+        .values()
+        .find(|d| d.is_self)
+        .map(|d| d.key);
+    let b = render(&mut a, 180, 46);
+    let dir = std::env::var("NITRONET_SNAPSHOT_DIR").unwrap_or_else(|_| "target/snapshots".into());
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        format!("{dir}/devices-live.html"),
+        to_html(&b, "devices-live"),
+    )
+    .unwrap();
+    println!(
+        "{}",
+        buffer_text(&b)
+            .lines()
+            .skip(8)
+            .take(14)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn ipv6_tail_fits_by_group() {
+    assert_eq!(
+        super::view::v6_tail("…:9c1:5e2d:aa10:7b3c", 15),
+        "…:aa10:7b3c"
+    );
+    assert_eq!(super::view::v6_tail("fe80::1", 15), "fe80::1");
 }

@@ -24,6 +24,7 @@ use ratatui::widgets::TableState;
 
 pub use fmt::{fmt_addr, human};
 
+use crate::lan::{DevKey, Lan, LanState};
 use crate::sampler::{Owner, ProcRow, Sampler, Snapshot, SockRow};
 
 /// Samples kept for graphs. That's enough to fill a 300-column-wide graph at
@@ -38,10 +39,20 @@ pub fn run(
 ) -> io::Result<()> {
     let _mouse = MouseCapture::enable();
     let mut app = App::new(first, interval);
+    app.lan = Some(Lan::start());
     let mut next = Instant::now() + interval;
     loop {
+        if let Some(lan) = &app.lan {
+            app.lan_state = lan.snapshot();
+        }
         terminal.draw(|f| view::draw(&mut app, f))?;
-        let timeout = next.saturating_duration_since(Instant::now());
+        let mut timeout = next.saturating_duration_since(Instant::now());
+        // Redraw often while a scan or port probe runs, so progress is live.
+        let busy =
+            app.lan_state.scanning.is_some() || app.lan_state.devices.values().any(|d| d.probing);
+        if busy {
+            timeout = timeout.min(Duration::from_millis(150));
+        }
         if event::poll(timeout)? {
             let quit = match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
@@ -92,6 +103,15 @@ impl Drop for MouseCapture {
 pub(crate) enum Tab {
     Procs,
     Sockets,
+    Devices,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DevSort {
+    Ip,
+    Name,
+    Vendor,
+    Seen,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -236,6 +256,12 @@ pub(crate) struct App {
     /// The selected items by identity; the TableStates hold their current row.
     pub proc_sel: Option<ProcKey>,
     pub sock_sel: Option<u64>,
+    pub dev_state: TableState,
+    pub dev_sel: Option<DevKey>,
+    pub dev_sort: DevSort,
+    /// The LAN scanner (None in tests) and its latest state.
+    pub lan: Option<Lan>,
+    pub lan_state: LanState,
     pub history: History,
     pub hit: HitMap,
 }
@@ -260,6 +286,11 @@ impl App {
             sock_state: TableState::default().with_selected(0),
             proc_sel: None,
             sock_sel: None,
+            dev_state: TableState::default().with_selected(0),
+            dev_sel: None,
+            dev_sort: DevSort::Ip,
+            lan: None,
+            lan_state: LanState::default(),
             history: History::default(),
             hit: HitMap::default(),
         };
@@ -276,18 +307,38 @@ impl App {
         match self.tab {
             Tab::Procs => &mut self.proc_state,
             Tab::Sockets => &mut self.sock_state,
+            Tab::Devices => &mut self.dev_state,
         }
     }
 
+    /// Switches view. The first visit to Devices starts the LAN scanner, so
+    /// nitronet never sweeps the network unless asked.
     pub fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        if tab == Tab::Devices && self.lan_state.scans == 0 && self.lan_state.scanning.is_none() {
+            self.rescan();
+        }
+    }
+
+    fn rescan(&mut self) {
+        if let Some(lan) = &self.lan {
+            lan.scan_now();
+            // Show "scanning" at once rather than after the next snapshot.
+            self.lan_state.scanning.get_or_insert((0, 0));
+        }
     }
 
     /// Points each table's highlight at the row where its selected item is now.
     /// If the item is gone (the process exited or the socket closed), the
     /// highlight stays on the same row and takes whatever item is there.
     /// This runs before every draw and every move.
-    pub fn sync_selection(&mut self, views: &[ProcView], socks: &[usize]) {
+    pub fn sync_selection(&mut self, views: &[ProcView], socks: &[usize], devs: &[DevKey]) {
+        let row = self
+            .dev_sel
+            .and_then(|ip| devs.iter().position(|d| *d == ip));
+        let row = row.unwrap_or_else(|| self.dev_state.selected().unwrap_or(0));
+        self.select_dev(devs, row);
+
         let row = match &self.proc_sel {
             Some(key) => views.iter().position(|v| v.is(key)),
             None => None,
@@ -325,11 +376,22 @@ impl App {
         self.sock_sel = Some(self.snap.sockets[socks[row]].sock.cookie);
     }
 
+    fn select_dev(&mut self, devs: &[DevKey], row: usize) {
+        if devs.is_empty() {
+            self.dev_state.select(None);
+            return;
+        }
+        let row = row.min(devs.len() - 1);
+        self.dev_state.select(Some(row));
+        self.dev_sel = Some(devs[row]);
+    }
+
     /// Moves the current tab's selection. `to` maps (current row, row count) to the new row.
     fn move_to(&mut self, to: impl FnOnce(usize, usize) -> usize) {
         let views = self.proc_views();
         let socks = self.sock_rows();
-        self.sync_selection(&views, &socks);
+        let devs = self.dev_rows();
+        self.sync_selection(&views, &socks, &devs);
         match self.tab {
             Tab::Procs => {
                 let row = to(self.proc_state.selected().unwrap_or(0), views.len());
@@ -338,6 +400,10 @@ impl App {
             Tab::Sockets => {
                 let row = to(self.sock_state.selected().unwrap_or(0), socks.len());
                 self.select_sock(&socks, row);
+            }
+            Tab::Devices => {
+                let row = to(self.dev_state.selected().unwrap_or(0), devs.len());
+                self.select_dev(&devs, row);
             }
         }
     }
@@ -392,15 +458,28 @@ impl App {
             }
             KeyCode::Char('?') | KeyCode::F(1) => self.show_help = true,
             KeyCode::Char('/') => self.editing_filter = true,
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
-                self.set_tab(if self.tab == Tab::Procs {
-                    Tab::Sockets
-                } else {
-                    Tab::Procs
-                })
-            }
+            KeyCode::Tab | KeyCode::Right => self.set_tab(match self.tab {
+                Tab::Procs => Tab::Sockets,
+                Tab::Sockets => Tab::Devices,
+                Tab::Devices => Tab::Procs,
+            }),
+            KeyCode::BackTab | KeyCode::Left => self.set_tab(match self.tab {
+                Tab::Procs => Tab::Devices,
+                Tab::Sockets => Tab::Procs,
+                Tab::Devices => Tab::Sockets,
+            }),
             KeyCode::Char('1') => self.set_tab(Tab::Procs),
             KeyCode::Char('2') => self.set_tab(Tab::Sockets),
+            KeyCode::Char('3') => self.set_tab(Tab::Devices),
+            KeyCode::Char('R') | KeyCode::F(5) => self.rescan(),
+            KeyCode::Char('p') if self.tab == Tab::Devices => {
+                if let (Some(lan), Some(key)) = (&self.lan, self.dev_sel) {
+                    lan.probe(key);
+                    if let Some(d) = self.lan_state.devices.get_mut(&key) {
+                        d.probing = true;
+                    }
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
             KeyCode::PageDown => self.move_by(20),
@@ -412,7 +491,7 @@ impl App {
             KeyCode::Char('g') => self.group_by_program = !self.group_by_program,
             KeyCode::Char('l') => self.listening_only = !self.listening_only,
             KeyCode::Enter | KeyCode::Char('d') => self.show_detail = !self.show_detail,
-            KeyCode::Char(' ') | KeyCode::Char('p') => self.paused = !self.paused,
+            KeyCode::Char(' ') => self.paused = !self.paused,
             _ => {}
         }
         false
@@ -435,6 +514,14 @@ impl App {
                     SockSort::Port => SockSort::State,
                     SockSort::State => SockSort::Program,
                     SockSort::Program => SockSort::Rate,
+                }
+            }
+            Tab::Devices => {
+                self.dev_sort = match self.dev_sort {
+                    DevSort::Ip => DevSort::Name,
+                    DevSort::Name => DevSort::Vendor,
+                    DevSort::Vendor => DevSort::Seen,
+                    DevSort::Seen => DevSort::Ip,
                 }
             }
         }
@@ -515,6 +602,58 @@ impl App {
             .iter()
             .map(|p| (p.owner, p.name.clone()))
             .collect()
+    }
+
+    /// The device rows to show, filtered and sorted.
+    pub fn dev_rows(&self) -> Vec<DevKey> {
+        let devs = &self.lan_state.devices;
+        let mut keys: Vec<DevKey> = devs
+            .values()
+            .filter(|d| {
+                let ips: Vec<String> = d.ips().map(|ip| ip.to_string()).collect();
+                let mac = d
+                    .mac
+                    .as_ref()
+                    .map(crate::lan::discover::fmt_mac)
+                    .unwrap_or_default();
+                let mut fields: Vec<&str> = ips.iter().map(String::as_str).collect();
+                fields.push(&mac);
+                fields.extend(d.name.as_deref());
+                fields.extend(d.vendor.as_deref());
+                if d.is_gateway {
+                    fields.push("gateway");
+                }
+                self.matches(&fields)
+            })
+            .map(|d| d.key)
+            .collect();
+        let d = |k: &DevKey| &devs[k];
+        match self.dev_sort {
+            // IPv4 order; IPv6-only devices after, by address.
+            DevSort::Ip => {
+                keys.sort_by_key(|k| (d(k).ipv4.is_none(), d(k).ipv4, d(k).ipv6.first().copied()))
+            }
+            // Unnamed devices go last.
+            DevSort::Name => keys.sort_by_key(|k| {
+                (
+                    d(k).name.is_none(),
+                    d(k).name.as_ref().map(|n| n.to_lowercase()),
+                )
+            }),
+            DevSort::Vendor => keys.sort_by_key(|k| {
+                (
+                    d(k).vendor.is_none(),
+                    d(k).vendor.as_ref().map(|v| v.to_lowercase()),
+                )
+            }),
+            DevSort::Seen => {
+                keys.sort_by_key(|k| (!d(k).online, std::cmp::Reverse(d(k).last_seen)))
+            }
+        }
+        if self.reverse {
+            keys.reverse();
+        }
+        keys
     }
 
     pub fn matches(&self, fields: &[&str]) -> bool {

@@ -1,8 +1,10 @@
-//! Minimal NETLINK_SOCK_DIAG client. This is the same kernel interface `ss`
-//! uses to list sockets. It is written by hand on top of `libc` (already in
-//! the tree through crossterm), so no netlink crate is needed.
+//! Minimal netlink client: NETLINK_SOCK_DIAG to list sockets (the kernel
+//! interface `ss` uses), and NETLINK_ROUTE to read the neighbor (ARP and
+//! NDP) table (what `ip neigh` shows). It is written by hand on top of `libc`
+//! (already in the tree through crossterm), so no netlink crate is needed.
 //!
-//! Layouts come from <linux/netlink.h>, <linux/inet_diag.h> and <linux/tcp.h>.
+//! Layouts come from <linux/netlink.h>, <linux/inet_diag.h>, <linux/tcp.h>,
+//! <linux/rtnetlink.h> and <linux/neighbour.h>.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -139,14 +141,7 @@ impl Diag {
 
     fn dump(&mut self, proto: Proto, family: u8, out: &mut Vec<SockInfo>) -> io::Result<()> {
         self.seq = self.seq.wrapping_add(1);
-        let seq = self.seq;
-
-        let mut req = [0u8; NLMSG_HDRLEN + REQ_LEN];
-        req[0..4].copy_from_slice(&((NLMSG_HDRLEN + REQ_LEN) as u32).to_ne_bytes());
-        req[4..6].copy_from_slice(&SOCK_DIAG_BY_FAMILY.to_ne_bytes());
-        req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
-        req[8..12].copy_from_slice(&seq.to_ne_bytes());
-        let r = &mut req[NLMSG_HDRLEN..];
+        let mut r = [0u8; REQ_LEN];
         r[0] = family;
         r[1] = match proto {
             Proto::Tcp => libc::IPPROTO_TCP as u8,
@@ -158,81 +153,200 @@ impl Diag {
             Proto::Udp => 0,
         };
         r[4..8].copy_from_slice(&u32::MAX.to_ne_bytes()); // all states
-
-        // SAFETY: sockaddr_nl is plain data, and all zeroes is a valid value.
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        // SAFETY: the pointers and lengths describe live, correctly sized buffers.
-        let sent = unsafe {
-            libc::sendto(
-                self.fd.as_raw_fd(),
-                req.as_ptr().cast(),
-                req.len(),
-                0,
-                (&raw const addr).cast(),
-                size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if sent < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        loop {
-            // SAFETY: buf is a live, writable buffer of buf.len() bytes.
-            let n = unsafe {
-                libc::recv(
-                    self.fd.as_raw_fd(),
-                    self.buf.as_mut_ptr().cast(),
-                    self.buf.len(),
-                    0,
-                )
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::Interrupted {
-                    continue;
+        dump_request(
+            &self.fd,
+            &mut self.buf,
+            self.seq,
+            SOCK_DIAG_BY_FAMILY,
+            &r,
+            |ty, body| {
+                if ty == SOCK_DIAG_BY_FAMILY
+                    && let Some(s) = parse_msg(proto, body)
+                {
+                    out.push(s);
                 }
-                return Err(e);
+            },
+        )
+    }
+}
+
+/// Sends a dump request of type `ty` with `payload` after the header, and
+/// passes each reply message's (type, body) to `each` until the dump ends.
+fn dump_request(
+    fd: &OwnedFd,
+    buf: &mut [u8],
+    seq: u32,
+    ty: u16,
+    payload: &[u8],
+    mut each: impl FnMut(u16, &[u8]),
+) -> io::Result<()> {
+    let mut req = vec![0u8; NLMSG_HDRLEN + payload.len()];
+    let len = req.len() as u32;
+    req[0..4].copy_from_slice(&len.to_ne_bytes());
+    req[4..6].copy_from_slice(&ty.to_ne_bytes());
+    req[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+    req[8..12].copy_from_slice(&seq.to_ne_bytes());
+    req[NLMSG_HDRLEN..].copy_from_slice(payload);
+
+    // SAFETY: sockaddr_nl is plain data, and all zeroes is a valid value.
+    let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: the pointers and lengths describe live, correctly sized buffers.
+    let sent = unsafe {
+        libc::sendto(
+            fd.as_raw_fd(),
+            req.as_ptr().cast(),
+            req.len(),
+            0,
+            (&raw const addr).cast(),
+            size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    loop {
+        // SAFETY: buf is a live, writable buffer of buf.len() bytes.
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            let data = &self.buf[..n as usize];
-            let mut off = 0;
-            while off + NLMSG_HDRLEN <= data.len() {
-                let len = u32_at(data, off) as usize;
-                if len < NLMSG_HDRLEN || off + len > data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "bad netlink message length",
-                    ));
-                }
-                let ty = u16_at(data, off + 4);
-                let msg_seq = u32_at(data, off + 8);
-                let body = &data[off + NLMSG_HDRLEN..off + len];
-                off += align4(len);
-                if msg_seq != seq {
-                    continue;
-                }
-                match ty {
-                    NLMSG_DONE => return Ok(()),
-                    NLMSG_ERROR => {
-                        let err = if body.len() >= 4 {
-                            u32_at(body, 0) as i32
-                        } else {
-                            0
-                        };
-                        if err != 0 {
-                            return Err(io::Error::from_raw_os_error(-err));
-                        }
+            return Err(e);
+        }
+        let data = &buf[..n as usize];
+        let mut off = 0;
+        while off + NLMSG_HDRLEN <= data.len() {
+            let len = u32_at(data, off) as usize;
+            if len < NLMSG_HDRLEN || off + len > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bad netlink message length",
+                ));
+            }
+            let msg_ty = u16_at(data, off + 4);
+            let msg_seq = u32_at(data, off + 8);
+            let body = &data[off + NLMSG_HDRLEN..off + len];
+            off += align4(len);
+            if msg_seq != seq {
+                continue;
+            }
+            match msg_ty {
+                NLMSG_DONE => return Ok(()),
+                NLMSG_ERROR => {
+                    let err = if body.len() >= 4 {
+                        u32_at(body, 0) as i32
+                    } else {
+                        0
+                    };
+                    if err != 0 {
+                        return Err(io::Error::from_raw_os_error(-err));
                     }
-                    SOCK_DIAG_BY_FAMILY => {
-                        if let Some(s) = parse_msg(proto, body) {
-                            out.push(s);
-                        }
-                    }
-                    _ => {}
                 }
+                _ => each(msg_ty, body),
             }
         }
     }
+}
+
+// ------------------------------------------------------------ neighbor table
+
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_GETNEIGH: u16 = 30;
+/// struct ndmsg
+const NDMSG_LEN: usize = 12;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const NTF_ROUTER: u8 = 0x80;
+
+/// Neighbor states (NUD_*). An entry is usable when it is in any of `NUD_VALID`.
+pub const NUD_REACHABLE: u16 = 0x02;
+pub const NUD_VALID: u16 = 0x02 | 0x04 | 0x08 | 0x10 | 0x40 | 0x80;
+
+/// One entry of the kernel's neighbor table: an address on a local link and
+/// the MAC it resolved to.
+#[derive(Clone, Debug)]
+pub struct Neighbor {
+    pub ip: IpAddr,
+    pub mac: [u8; 6],
+    pub ifindex: u32,
+    pub state: u16,
+    /// The neighbor advertised itself as an IPv6 router.
+    pub router: bool,
+}
+
+/// Dumps the neighbor table for `family` (AF_INET or AF_INET6). Entries
+/// without a 6-byte link-layer address (incomplete, failed, or not Ethernet)
+/// are skipped.
+pub fn neighbors(family: libc::c_int) -> io::Result<Vec<Neighbor>> {
+    // SAFETY: plain syscall. Its result is checked before being wrapped.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a fresh, valid descriptor that we own.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut req = [0u8; NDMSG_LEN];
+    req[0] = family as u8;
+    let mut out = Vec::new();
+    dump_request(&fd, &mut buf, 1, RTM_GETNEIGH, &req, |ty, body| {
+        if ty == RTM_NEWNEIGH
+            && let Some(n) = parse_neighbor(body)
+        {
+            out.push(n);
+        }
+    })?;
+    Ok(out)
+}
+
+fn parse_neighbor(m: &[u8]) -> Option<Neighbor> {
+    if m.len() < NDMSG_LEN {
+        return None;
+    }
+    let ifindex = u32_at(m, 4);
+    let state = u16_at(m, 8);
+    let router = m[10] & NTF_ROUTER != 0;
+    let (mut ip, mut mac) = (None, None);
+    let mut off = NDMSG_LEN;
+    while off + 4 <= m.len() {
+        let alen = u16_at(m, off) as usize;
+        if alen < 4 || off + alen > m.len() {
+            break;
+        }
+        let payload = &m[off + 4..off + alen];
+        match (u16_at(m, off + 2) & NLA_TYPE_MASK, payload.len()) {
+            (NDA_DST, 4) => {
+                ip = Some(IpAddr::V4(Ipv4Addr::from(
+                    <[u8; 4]>::try_from(payload).ok()?,
+                )))
+            }
+            (NDA_DST, 16) => {
+                ip = Some(IpAddr::V6(Ipv6Addr::from(
+                    <[u8; 16]>::try_from(payload).ok()?,
+                )))
+            }
+            (NDA_LLADDR, 6) => mac = Some(<[u8; 6]>::try_from(payload).ok()?),
+            _ => {}
+        }
+        off += align4(alen);
+    }
+    let mac = mac.filter(|m| *m != [0; 6])?;
+    Some(Neighbor {
+        ip: ip?,
+        mac,
+        ifindex,
+        state,
+        router,
+    })
 }
 
 fn parse_msg(proto: Proto, m: &[u8]) -> Option<SockInfo> {
@@ -298,4 +412,41 @@ fn u32_at(b: &[u8], o: usize) -> u32 {
 
 fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_ne_bytes(b[o..o + 8].try_into().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_neighbor_messages() {
+        let mut m = vec![0u8; NDMSG_LEN];
+        m[0] = libc::AF_INET6 as u8;
+        m[4..8].copy_from_slice(&2u32.to_ne_bytes());
+        m[8..10].copy_from_slice(&NUD_REACHABLE.to_ne_bytes());
+        m[10] = NTF_ROUTER;
+        let ip: Ipv6Addr = "fe80::1e61:b4ff:feaa:bb01".parse().unwrap();
+        m.extend_from_slice(&20u16.to_ne_bytes());
+        m.extend_from_slice(&NDA_DST.to_ne_bytes());
+        m.extend_from_slice(&ip.octets());
+        m.extend_from_slice(&10u16.to_ne_bytes());
+        m.extend_from_slice(&NDA_LLADDR.to_ne_bytes());
+        m.extend_from_slice(&[0x1c, 0x61, 0xb4, 0xaa, 0xbb, 0x01, 0, 0]);
+        let n = parse_neighbor(&m).unwrap();
+        assert_eq!(n.ip, IpAddr::V6(ip));
+        assert_eq!(n.mac, [0x1c, 0x61, 0xb4, 0xaa, 0xbb, 0x01]);
+        assert_eq!((n.ifindex, n.state, n.router), (2, NUD_REACHABLE, true));
+    }
+
+    #[test]
+    fn reads_live_neighbor_table() {
+        // Works unprivileged; the table may legitimately be empty.
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let all = neighbors(family).unwrap();
+            assert!(
+                all.iter()
+                    .all(|n| n.ip.is_ipv4() == (family == libc::AF_INET))
+            );
+        }
+    }
 }

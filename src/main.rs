@@ -1,4 +1,5 @@
 mod bpf;
+mod lan;
 mod netlink;
 mod procfs;
 mod sampler;
@@ -19,6 +20,7 @@ USAGE:
 OPTIONS:
     -i, --interval <SECS>   Refresh interval in seconds [default: 1]
         --once              Take two samples one interval apart, print a text report, and exit
+        --scan              Scan the local network for devices, print them, and exit
         --no-ebpf           Don't load eBPF programs; use TCP-only tcp_info counters
     -h, --help              Show this help
 
@@ -31,6 +33,7 @@ tcp_info counters, and other users' processes can't be attributed.";
 struct Args {
     interval: Duration,
     once: bool,
+    scan: bool,
     ebpf: bool,
 }
 
@@ -38,6 +41,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut args = Args {
         interval: Duration::from_secs(1),
         once: false,
+        scan: false,
         ebpf: true,
     };
     let mut it = std::env::args().skip(1);
@@ -46,6 +50,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--help" => return Ok(None),
             "--once" => args.once = true,
             "--no-ebpf" => args.ebpf = false,
+            "--scan" => args.scan = true,
             "-i" | "--interval" => {
                 let v = it.next().ok_or("--interval needs a value")?;
                 let secs: f64 = v.parse().map_err(|_| format!("invalid interval: {v}"))?;
@@ -75,6 +80,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         println!("{HELP}");
         return Ok(());
     };
+    if args.scan {
+        print_devices(&lan::scan_blocking());
+        return Ok(());
+    }
     let mut sampler = Sampler::new(args.ebpf)?;
     // A failure other than missing permissions is worth showing in full (it may include the verifier log).
     if let Source::TcpInfo { reason } = sampler.source()
@@ -178,5 +187,68 @@ fn print_report(s: &sampler::Snapshot) {
             pid(r.owner),
             names.get(&r.owner).copied().unwrap_or("?")
         );
+    }
+}
+
+fn print_devices(s: &lan::LanState) {
+    let Some(iface) = &s.iface else {
+        eprintln!(
+            "nitronet: {}",
+            s.error.as_deref().unwrap_or("no usable network interface")
+        );
+        return;
+    };
+    let method = match s.method {
+        Some(lan::Method::Arp) => "ARP sweep",
+        Some(lan::Method::Ping) => "ping sweep + neighbor table (run as root for a full ARP sweep)",
+        Some(lan::Method::Udp) => "UDP nudge + neighbor table (run as root for a full ARP sweep)",
+        None => "not scanned",
+    };
+    let v6 = match (&s.ipv6_error, iface.range6()) {
+        (Some(e), _) => format!(" · IPv6 failed: {e}"),
+        (None, _) if !iface.has_ipv6() => " · no IPv6 on this interface".into(),
+        (None, Some(r)) => format!(" + {r} (all-nodes ping)"),
+        (None, None) => " + IPv6 link-local (all-nodes ping)".into(),
+    };
+    println!("{} on {} · {method}{v6}", iface.range(), iface.name);
+    if let Some(e) = &s.error {
+        println!("note: {e}");
+    }
+    println!(
+        "\n{:<15}  {:<17}  {:>8}  {:<28}  NAME",
+        "IP", "MAC", "RTT", "VENDOR"
+    );
+    let mut devs: Vec<&lan::Device> = s.devices.values().filter(|d| d.online).collect();
+    devs.sort_by_key(|d| (d.ipv4.is_none(), d.ipv4, d.ipv6.first().copied()));
+    for d in devs {
+        let vendor = match (&d.vendor, d.random_mac()) {
+            (Some(v), _) => v.clone(),
+            (None, true) => "(private address)".into(),
+            (None, false) => String::new(),
+        };
+        let mut name = d.name.clone().unwrap_or_default();
+        if d.is_self {
+            name.push_str("  [this machine]");
+        }
+        if d.is_gateway {
+            name.push_str("  [gateway]");
+        }
+        println!(
+            "{:<15}  {:<17}  {:>8}  {:<28.28}  {name}",
+            d.ipv4
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "(IPv6 only)".into()),
+            d.mac
+                .as_ref()
+                .map(lan::discover::fmt_mac)
+                .unwrap_or_default(),
+            d.rtt
+                .map(|r| format!("{:.1}ms", r.as_secs_f64() * 1000.0))
+                .unwrap_or_default(),
+            vendor,
+        );
+        for a in &d.ipv6 {
+            println!("  {a}");
+        }
     }
 }

@@ -85,6 +85,45 @@ pub fn elide_end(s: &str, max: usize) -> String {
     out
 }
 
+/// Compact age: "now", "42s", "5m", "3h".
+pub fn ago(t: std::time::Instant) -> String {
+    let s = t.elapsed().as_secs();
+    match s {
+        0..5 => "now".into(),
+        5..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        _ => format!("{}h", s / 3600),
+    }
+}
+
+/// Round-trip time: "0.9 ms", "48 ms", "1.2 s".
+pub fn fmt_rtt(d: std::time::Duration) -> String {
+    let ms = d.as_secs_f64() * 1000.0;
+    if ms < 10.0 {
+        format!("{ms:.1} ms")
+    } else if ms < 1000.0 {
+        format!("{ms:.0} ms")
+    } else {
+        format!("{:.1} s", ms / 1000.0)
+    }
+}
+
+/// A compact IPv6 address for a narrow column. Inside one of our own
+/// prefixes only the interface part is shown ("…:ccb3:1923:75a6:cc01"), since
+/// the prefix is the same for every device; anything else is shown in full.
+pub fn short_v6(a: &std::net::Ipv6Addr, ours: &[(std::net::Ipv6Addr, u8)]) -> String {
+    let bits = u128::from(*a);
+    let local = !a.is_unicast_link_local()
+        && ours.iter().any(|(p, len)| {
+            *len > 0 && *len <= 64 && (bits ^ u128::from(*p)) >> (128 - *len as u32) == 0
+        });
+    if !local {
+        return a.to_string();
+    }
+    let iid: Vec<String> = a.segments()[4..].iter().map(|g| format!("{g:x}")).collect();
+    format!("…:{}", iid.join(":"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +143,12 @@ mod tests {
             "[2001:db8…b02]:37422"
         );
         assert_eq!(elide_end("wayland-wm@hyprland.desktop", 10), "wayland-w…");
+        let ours = [("2001:db8:322e:0:32c5:99ff:feaa:bb02".parse().unwrap(), 64)];
+        let a = "2001:db8:322e:0:ccb3:1923:75a6:cc01".parse().unwrap();
+        assert_eq!(short_v6(&a, &ours), "…:ccb3:1923:75a6:cc01");
+        let other = "2001:db8::1".parse().unwrap();
+        assert_eq!(short_v6(&other, &ours), "2001:db8::1");
+        let ll = "fe80::ca4a:a0ff:feaa:bb03".parse().unwrap();
+        assert_eq!(short_v6(&ll, &ours), "fe80::ca4a:a0ff:feaa:bb03");
     }
 }
