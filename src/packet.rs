@@ -341,7 +341,7 @@ fn tcp_app(p: &[u8], sport: Option<u16>, dport: Option<u16>) -> Option<String> {
     }
     // DNS over TCP has a two-byte length prefix.
     if sport == Some(53) || dport == Some(53) {
-        return p.get(2..).and_then(dns);
+        return p.get(2..).and_then(dns).map(|d| format!("DNS {d}"));
     }
     for m in [
         "GET ", "POST ", "PUT ", "HEAD ", "DELETE ", "OPTIONS ", "PATCH ", "CONNECT ", "HTTP/1.",
@@ -635,6 +635,10 @@ const MAX_FLOWS: usize = 50_000;
 /// The reason `guess` gives for high-entropy bytes. Only a hint, so it isn't
 /// remembered for the rest of the conversation.
 const RANDOM: &str = "looks random";
+const SSH_GREETING: &str = "SSH greeting";
+/// FTP, SMTP (and submission), POP3 and IMAP: where login commands are
+/// sent as lines of text. Elsewhere "PASS ..." or "x LOGIN y z" is just text.
+const MAIL_FTP_PORTS: &[u16] = &[21, 25, 110, 143, 587, 2525];
 
 impl Classifier {
     /// Sets `p.content`, and adds a hint to the info line when the decoder
@@ -645,12 +649,10 @@ impl Classifier {
         match (content, flow) {
             // A protocol known to be encrypted (TLS, QUIC, SSH, its port): the
             // rest of the conversation is too, even mid-record segments.
-            (Content::Encrypted(why), Some(f)) if why != RANDOM => {
-                if self.encrypted.len() > MAX_FLOWS {
-                    self.encrypted.clear();
-                }
-                self.encrypted.entry(f).or_insert(why);
-            }
+            (Content::Encrypted(why), Some(f)) if why != RANDOM => self.remember_encrypted(f, why),
+            // The greeting is readable, but everything after it is encrypted,
+            // whatever the port.
+            (Content::Plain(SSH_GREETING), Some(f)) => self.remember_encrypted(f, "SSH"),
             (Content::Plain("HTTP"), Some(f)) => {
                 if self.http.len() > MAX_FLOWS {
                     self.http.clear();
@@ -660,8 +662,16 @@ impl Classifier {
             _ => {}
         }
         p.content = content;
-        if content.unencrypted_data() {
-            p.secret = credentials(p.payload());
+        if content.unencrypted_data()
+            && let Some(d) = &p.head
+        {
+            let mail_or_ftp = [d.sport, d.dport]
+                .iter()
+                .any(|p| p.is_some_and(|p| MAIL_FTP_PORTS.contains(&p)));
+            p.secret = credentials(
+                p.payload(),
+                mail_or_ftp && content != Content::Plain("HTTP"),
+            );
         }
         let preview = match content {
             Content::Plain("text") => Some(printable_line(p.payload(), 80)),
@@ -675,6 +685,13 @@ impl Classifier {
             d.info.push_str("  ");
             d.info.push_str(&extra);
         }
+    }
+
+    fn remember_encrypted(&mut self, f: FlowKey, why: &'static str) {
+        if self.encrypted.len() > MAX_FLOWS {
+            self.encrypted.clear();
+        }
+        self.encrypted.entry(f).or_insert(why);
     }
 
     fn classify(&self, p: &Packet, flow: Option<&FlowKey>) -> Content {
@@ -701,7 +718,7 @@ impl Classifier {
             return Content::Encrypted("QUIC");
         }
         if app.starts_with("SSH-") {
-            return Content::Plain("SSH greeting");
+            return Content::Plain(SSH_GREETING);
         }
         for (prefix, why) in [
             ("DNS", "DNS"),
@@ -721,7 +738,7 @@ impl Classifier {
         if let Some(why) = flow.and_then(|f| self.encrypted.get(f)) {
             return Content::Encrypted(why);
         }
-        if app.starts_with("SSH") || ports.contains(&Some(22)) && d.proto() == "TCP" {
+        if ports.contains(&Some(22)) && d.proto() == "TCP" {
             return Content::Encrypted("SSH");
         }
         for &(proto, port, why) in ENCRYPTED_PORTS {
@@ -759,8 +776,9 @@ pub fn find_ignore_case_from(hay: &[u8], needle: &[u8], from: usize) -> Option<u
 
 /// What kind of login secret a readable payload carries, if any: a password
 /// field in a form, JSON or query string, an HTTP Authorization header, or
-/// the login commands of FTP, POP3, SMTP and IMAP.
-pub fn credentials(b: &[u8]) -> Option<&'static str> {
+/// (with `commands`, on a mail or FTP connection) the login commands of FTP,
+/// POP3, SMTP and IMAP.
+pub fn credentials(b: &[u8], commands: bool) -> Option<&'static str> {
     // Header names and commands are case-insensitive.
     let find = |needle: &[u8]| find_ignore_case(b, needle);
     let at_line_start = |i: usize| i == 0 || b[i - 1] == b'\n';
@@ -809,7 +827,14 @@ pub fn credentials(b: &[u8]) -> Option<&'static str> {
             }
         }
     }
+    if !commands {
+        return None;
+    }
+    // These protocols end each command with CRLF.
     for line in b.split(|&c| c == b'\n') {
+        let Some(line) = line.strip_suffix(b"\r") else {
+            continue;
+        };
         let mut words = line.split(|&c| c == b' ').filter(|w| !w.is_empty());
         let (first, second) = (words.next().unwrap_or(b""), words.next());
         if first.eq_ignore_ascii_case(b"PASS") && second.is_some() {
@@ -1239,7 +1264,7 @@ pub(crate) mod tests {
         ];
         for (b, want) in yes {
             assert_eq!(
-                credentials(b),
+                credentials(b, true),
                 Some(*want),
                 "{}",
                 String::from_utf8_lossy(b)
@@ -1253,9 +1278,25 @@ pub(crate) mod tests {
             b"The password is never sent.",
             b"X-Authorization-Hint: none\r\n",
             b"a001 LOGOUT\r\n",
+            // A line not ended with CRLF isn't a command.
+            b"PASS hunter2\n",
         ];
         for b in no {
-            assert_eq!(credentials(b), None, "{}", String::from_utf8_lossy(b));
+            assert_eq!(credentials(b, true), None, "{}", String::from_utf8_lossy(b));
+        }
+        // Login commands count only on mail and FTP connections: elsewhere
+        // they are ordinary words.
+        for b in [
+            &b"Please login to continue\r\n"[..],
+            b"Pass the salt please\r\n",
+            b"PASS hunter2\r\n",
+        ] {
+            assert_eq!(
+                credentials(b, false),
+                None,
+                "{}",
+                String::from_utf8_lossy(b)
+            );
         }
         // Set on readable packets only.
         let mut c = Classifier::default();
@@ -1287,6 +1328,54 @@ pub(crate) mod tests {
         );
         c.apply(&mut p);
         assert_eq!(p.secret, None);
+        // A login command on an IMAP connection, but not the same words in a
+        // web page.
+        let tcp = |dport: u16, data: &[u8]| {
+            packet(
+                ipv4(TCP, [10, 0, 0, 2], [10, 0, 0, 1], 5000, dport, 0x18, data),
+                true,
+            )
+        };
+        let mut p = tcp(143, b"a001 LOGIN alice hunter2\r\n");
+        c.apply(&mut p);
+        assert_eq!(p.secret, Some("IMAP login"));
+        let mut p = tcp(8080, b"Please login to continue, then pass go\r\n");
+        c.apply(&mut p);
+        assert_eq!(p.secret, None);
+    }
+
+    #[test]
+    fn dns_over_tcp_is_labelled() {
+        let mut q = vec![0, 29, 0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        let p = ipv4(TCP, [10, 0, 0, 2], [10, 0, 0, 1], 5000, 53, 0x18, &q);
+        let info = decode(&p, p.len() as u32).unwrap().info;
+        assert!(info.contains("DNS A? example.com"), "{info}");
+    }
+
+    #[test]
+    fn ssh_on_any_port_is_remembered_as_encrypted() {
+        let mut c = Classifier::default();
+        let tcp = |sport, dport, data: &[u8]| {
+            packet(
+                ipv4(TCP, [10, 0, 0, 2], [10, 0, 0, 1], sport, dport, 0x18, data),
+                true,
+            )
+        };
+        let mut hello = tcp(5000, 2222, b"SSH-2.0-OpenSSH_9.9\r\n");
+        c.apply(&mut hello);
+        assert_eq!(hello.content, Content::Plain("SSH greeting"));
+        // Later packets of that conversation, either way, are SSH.
+        let mut later = tcp(5000, 2222, b"username=a&password=b but encrypted, honestly");
+        c.apply(&mut later);
+        assert_eq!(later.content, Content::Encrypted("SSH"));
+        assert_eq!(later.secret, None);
+        let mut back = tcp(2222, 5000, b"some bytes from the server side....");
+        back.outgoing = false;
+        back.head.as_mut().unwrap().src = "10.0.0.1".parse().unwrap();
+        back.head.as_mut().unwrap().dst = "10.0.0.2".parse().unwrap();
+        c.apply(&mut back);
+        assert_eq!(back.content, Content::Encrypted("SSH"));
     }
 
     #[test]
