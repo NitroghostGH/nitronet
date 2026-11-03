@@ -71,6 +71,8 @@ pub struct Snapshot {
     pub procs: Vec<ProcRow>,
     /// Physical-interface (rx, tx) bytes/s, a reference for the attributed sum.
     pub nic_rate: Option<(f64, f64)>,
+    /// Physical-interface (rx, tx) bytes since nitronet started.
+    pub nic_total: Option<(u64, u64)>,
     /// Sum of all attributed rates.
     pub seen_rate: (f64, f64),
     pub hidden_procs: usize,
@@ -103,6 +105,7 @@ pub struct Sampler {
     /// last bytes still go to the process that owned it.
     seen: HashMap<u64, Owner>,
     nic_prev: Option<(u64, u64)>,
+    nic_start: Option<(u64, u64)>,
     acc: HashMap<Owner, Acc>,
 }
 
@@ -148,6 +151,7 @@ impl Sampler {
             prev: HashMap::new(),
             seen: HashMap::new(),
             nic_prev: None,
+            nic_start: None,
             acc: HashMap::new(),
         })
     }
@@ -298,6 +302,16 @@ impl Sampler {
             .iter()
             .fold((0.0, 0.0), |(i, o), p| (i + p.rate_in, o + p.rate_out));
 
+        if self.nic_start.is_none() {
+            self.nic_start = nic;
+        }
+        let nic_total = match (self.nic_start, nic) {
+            (Some((srx, stx)), Some((rx, tx))) => {
+                Some((rx.saturating_sub(srx), tx.saturating_sub(stx)))
+            }
+            _ => None,
+        };
+
         self.prev = next_prev;
         self.seen = next_seen;
         self.nic_prev = nic;
@@ -307,6 +321,7 @@ impl Sampler {
             sockets: rows,
             procs,
             nic_rate,
+            nic_total,
             seen_rate,
             hidden_procs: pm.hidden,
             is_root: self.is_root,

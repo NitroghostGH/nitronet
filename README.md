@@ -10,7 +10,11 @@ sudo ./target/release/nitronet             # full mode: eBPF counting of TCP+UDP
 ./target/release/nitronet --no-ebpf        # root, but don't load eBPF
 ```
 
-Keys: `q` quit · `tab`/`1`/`2` switch tabs · `↑↓ PgUp PgDn Home End` move · `s` cycle sort · `g` group processes by program · `l` show only listening sockets · `space` pause
+Keys: `?` help · `q` quit · `/` filter · `tab` `←` `→` switch view · `↑↓ PgUp PgDn Home End` move · `s` cycle sort · `r` reverse · `g` group processes by program · `l` listening sockets only · `enter` toggle detail pane · `space` pause. The mouse works too: click tabs and rows, scroll with the wheel. Hold shift to select text while mouse capture is on.
+
+The UI uses truecolor and never paints the terminal background, so transparent terminals stay transparent. Set `NO_COLOR=1` for a monochrome version. Narrow terminals drop the less important columns, and below 70×22 the traffic graph collapses into a one-line header.
+
+UI changes can be reviewed without a terminal: `cargo test snapshots -- --ignored` writes colored HTML renders of every view (from deterministic fixture data) to `target/snapshots/`.
 
 ## How it works
 
