@@ -31,6 +31,9 @@ pub struct Iface {
     pub prefix: u8,
     pub mac: Option<Mac>,
     pub gateway: Option<Ipv4Addr>,
+    /// Next hops of the IPv6 default routes through this interface (usually
+    /// the router's link-local address).
+    pub gateway6: Vec<Ipv6Addr>,
     /// Our IPv6 addresses on this interface, with prefix lengths.
     pub ipv6: Vec<(Ipv6Addr, u8)>,
     /// The addresses to scan: the subnet's hosts, capped at a /22. On a larger
@@ -164,6 +167,9 @@ pub fn find_iface() -> io::Result<Iface> {
             IpAddr::V4(_) => None,
         })
         .collect();
+    let gateway6 = fs::read_to_string("/proc/net/ipv6_route")
+        .map(|s| default_routes6(&s, &name))
+        .unwrap_or_default();
     Ok(Iface {
         name,
         index,
@@ -171,6 +177,7 @@ pub fn find_iface() -> io::Result<Iface> {
         prefix,
         mac,
         gateway: gateway.flatten(),
+        gateway6,
         ipv6,
         first,
         count,
@@ -193,6 +200,26 @@ fn default_route() -> Option<(String, Option<Ipv4Addr>)> {
         return Some((f[0].to_string(), gw.filter(|g| !g.is_unspecified())));
     }
     None
+}
+
+/// Next hops of the IPv6 default routes through `iface`, from the text of
+/// /proc/net/ipv6_route: destination, prefix length, source, source prefix
+/// length, next hop, metric, refcount, use, flags, interface.
+fn default_routes6(table: &str, iface: &str) -> Vec<Ipv6Addr> {
+    let mut hops = Vec::new();
+    for line in table.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 10 || f[9] != iface || f[1] != "00" || f[0].bytes().any(|b| b != b'0') {
+            continue;
+        }
+        if let Ok(v) = u128::from_str_radix(f[4], 16) {
+            let hop = Ipv6Addr::from(v);
+            if !hop.is_unspecified() && !hops.contains(&hop) {
+                hops.push(hop);
+            }
+        }
+    }
+    hops
 }
 
 /// (interface, address, prefix length) for every IPv4 and IPv6 address on an
@@ -1017,6 +1044,22 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_default_routes() {
+        let table = "\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000001e61b4fffeaabb01 00000064 00000021 00000000 00400003     eno1
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000001e61b4fffeaabb01 00000400 00000001 00000000 00400003     eno1
+20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eno1
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe80000000000000000000000000beef 00000064 00000001 00000000 00400003     wlan0
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo
+";
+        let hop: Ipv6Addr = "fe80::1e61:b4ff:feaa:bb01".parse().unwrap();
+        // Duplicates collapse, other interfaces and non-default routes are skipped.
+        assert_eq!(default_routes6(table, "eno1"), vec![hop]);
+        assert_eq!(default_routes6(table, "lo"), Vec::<Ipv6Addr>::new());
+        assert_eq!(default_routes6("garbage", "eno1"), Vec::<Ipv6Addr>::new());
+    }
+
+    #[test]
     fn macs() {
         assert_eq!(
             parse_mac("1c:61:b4:aa:bb:01"),
@@ -1039,6 +1082,7 @@ mod tests {
             prefix: 24,
             mac: None,
             gateway: None,
+            gateway6: Vec::new(),
             ipv6: vec![
                 ("fe80::32c5:99ff:feaa:bb02".parse().unwrap(), 64),
                 ("2001:db8:322e:0:32c5:99ff:feaa:bb02".parse().unwrap(), 64),

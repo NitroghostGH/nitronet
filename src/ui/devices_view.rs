@@ -23,11 +23,11 @@ const DEV_COLS: [Col; 9] = [
     col("IP", 15, 0),
     col("NAME", 18, 0).flex(),
     col("IPV6", 25, 4),
-    col("VENDOR", 24, 2),
+    col("VENDOR", 20, 2),
     col("MAC", 17, 5),
     col("RTT", 8, 3).right(),
     col("SEEN", 6, 1).right(),
-    col("", 20, 6),
+    col("", 24, 6),
 ];
 
 /// The scanner's status for the panel border: interface, range, method and
@@ -163,7 +163,7 @@ fn dev_cells(t: &Theme, d: &Device, ours: &[(Ipv6Addr, u8)]) -> Vec<Cell<'static
         None => Span::styled("—", t.faint()),
     };
     let vendor = match (&d.vendor, d.random_mac()) {
-        (Some(v), _) => Span::styled(elide_end(v, 24), t.muted()),
+        (Some(v), _) => Span::styled(elide_end(v, DEV_COLS[4].width as usize), t.muted()),
         (None, true) => Span::styled("private address", t.faint().add_modifier(Modifier::ITALIC)),
         (None, false) => Span::styled("—", t.faint()),
     };
@@ -248,6 +248,9 @@ fn device_tags(t: &Theme, d: &Device) -> Vec<Span<'static>> {
     }
     if d.is_gateway {
         tag("gateway", t.fg(t.tcp));
+    }
+    if d.is_router {
+        tag("IPv6 router", t.fg(t.tcp));
     }
     if d.new {
         tag("new", t.fg(t.warn).add_modifier(Modifier::BOLD));

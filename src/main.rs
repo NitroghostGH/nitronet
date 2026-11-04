@@ -234,6 +234,9 @@ fn print_devices(s: &lan::LanState) {
         if d.is_gateway {
             name.push_str("  [gateway]");
         }
+        if d.is_router {
+            name.push_str("  [IPv6 router]");
+        }
         println!(
             "{:<15}  {:<17}  {:>8}  {:<28.28}  {name}",
             d.ipv4

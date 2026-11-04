@@ -52,7 +52,11 @@ pub struct Device {
     /// Answered in the most recent scan.
     pub online: bool,
     pub is_self: bool,
+    /// A next hop of the default route (IPv4 or IPv6).
     pub is_gateway: bool,
+    /// Announces itself as an IPv6 router without being the default gateway,
+    /// e.g. a Thread border router in a smart-home hub.
+    pub is_router: bool,
     /// First appeared after the initial scan.
     pub new: bool,
     /// Open common ports, once probed.
@@ -76,6 +80,7 @@ impl Device {
             online: true,
             is_self: false,
             is_gateway: false,
+            is_router: false,
             new,
             ports: None,
             probing: false,
@@ -398,7 +403,7 @@ fn run_scan(state: &Arc<Mutex<LanState>>, vendors: &Vendors, is_root: bool) {
             d.rtt = o.rtt;
         }
         d.is_self = is_self;
-        d.is_gateway = o.router || (iface.gateway.is_some() && d.ipv4 == iface.gateway);
+        (d.is_gateway, d.is_router) = roles(d, o.router, &iface);
         if d.vendor.is_none() {
             d.vendor = d.mac.as_ref().and_then(|m| vendors.lookup(m));
         }
@@ -683,6 +688,15 @@ pub fn scan_blocking() -> LanState {
     lan.snapshot()
 }
 
+/// (default gateway, other IPv6 router) for a device. `router` is the kernel's
+/// flag for a neighbor that announced itself as a router, which hubs that only
+/// route to their own networks also do, so it alone doesn't make a gateway.
+fn roles(d: &Device, router: bool, iface: &Iface) -> (bool, bool) {
+    let gateway = (iface.gateway.is_some() && d.ipv4 == iface.gateway)
+        || d.ipv6.iter().any(|a| iface.gateway6.contains(a));
+    (gateway, router && !gateway)
+}
+
 #[cfg(test)]
 pub(crate) fn test_device(
     ip: Ipv4Addr,
@@ -870,5 +884,42 @@ mod tests {
         assert!(d.has_ip("2001:db8::5".parse().unwrap()));
         assert!(!d.has_ip("2001:db8::6".parse().unwrap()));
         assert_eq!(d.primary_ip(), Some("192.168.0.5".parse().unwrap()));
+    }
+
+    #[test]
+    fn only_default_route_hops_are_gateways() {
+        let iface = Iface {
+            name: "eno1".into(),
+            index: 2,
+            ip: Ipv4Addr::new(192, 168, 0, 74),
+            prefix: 24,
+            mac: None,
+            gateway: Some(Ipv4Addr::new(192, 168, 0, 1)),
+            gateway6: vec![v6("fe80::1e61:b4ff:feaa:bb01")],
+            ipv6: Vec::new(),
+            first: Ipv4Addr::new(192, 168, 0, 1),
+            count: 254,
+            truncated: false,
+        };
+        let dev = |v4: Option<Ipv4Addr>, v6s: &[&str]| {
+            let mut d = Device::new(DevKey::V4(Ipv4Addr::UNSPECIFIED), Instant::now(), false);
+            d.ipv4 = v4;
+            d.ipv6 = v6s.iter().map(|s| v6(s)).collect();
+            d
+        };
+        let router = dev(Some(Ipv4Addr::new(192, 168, 0, 1)), &[]);
+        assert_eq!(roles(&router, false, &iface), (true, false));
+        let router6 = dev(
+            None,
+            &["2001:db8::1e61:b4ff:feaa:bb01", "fe80::1e61:b4ff:feaa:bb01"],
+        );
+        assert_eq!(roles(&router6, true, &iface), (true, false));
+        // A hub announcing routes to its own network isn't the gateway.
+        let hub = dev(
+            Some(Ipv4Addr::new(192, 168, 0, 155)),
+            &["fe80::d4fa:c4ff:feaa:bb09"],
+        );
+        assert_eq!(roles(&hub, true, &iface), (false, true));
+        assert_eq!(roles(&hub, false, &iface), (false, false));
     }
 }

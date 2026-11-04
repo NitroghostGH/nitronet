@@ -82,6 +82,9 @@ impl App {
                 if d.is_gateway {
                     fields.push("gateway");
                 }
+                if d.is_router {
+                    fields.push("router");
+                }
                 self.matches(&fields)
             })
             .map(|d| d.key)

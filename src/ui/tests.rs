@@ -340,6 +340,7 @@ pub(crate) fn lan_fixture() -> crate::lan::LanState {
             prefix: 24,
             mac: Some([0x30, 0xc5, 0x99, 0xaa, 0xbb, 0x02]),
             gateway: Some(ip(1)),
+            gateway6: vec!["fe80::1e61:b4ff:feaa:bb01".parse().unwrap()],
             ipv6: vec![
                 ("2001:db8:322e:0:32c5:99ff:feaa:bb02".parse().unwrap(), 64),
                 ("fe80::32c5:99ff:feaa:bb02".parse().unwrap(), 64),
