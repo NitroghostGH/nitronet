@@ -195,7 +195,7 @@ fn draw_header(app: &mut App, f: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let [stats, graph] = Layout::horizontal([Constraint::Length(32), Constraint::Fill(1)])
+    let [stats, graph] = Layout::horizontal([Constraint::Length(34), Constraint::Fill(1)])
         .spacing(2)
         .areas(inner.inner(Margin::new(1, 0)));
 
@@ -221,7 +221,7 @@ fn draw_header(app: &mut App, f: &mut Frame, area: Rect) {
             ]),
             Line::from(vec![
                 Span::styled("  peak ", t.faint()),
-                Span::styled(human(peak), t.muted()),
+                Span::styled(format!("{}/s", human(peak)), t.muted()),
                 Span::styled(if total.is_some() { "  total " } else { "" }, t.faint()),
                 Span::styled(
                     total.map(|b| human(b as f64)).unwrap_or_default(),

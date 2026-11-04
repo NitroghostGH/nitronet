@@ -51,12 +51,14 @@ pub fn amount(v: Option<f64>, color: Color) -> Line<'static> {
     line.right_aligned()
 }
 
-/// Shows wildcard addresses as "*" or "*:port", the way `ss` does.
+/// Shows an unset address (an unconnected socket's remote end) as "*". A
+/// wildcard with a port stays "0.0.0.0:53" or "[::]:53", as in `ss`, so the
+/// IPv4 and IPv6 sockets a service listens on don't look like duplicates.
 pub fn fmt_addr(a: SocketAddr) -> String {
-    match (a.ip().is_unspecified(), a.port()) {
-        (true, 0) => "*".into(),
-        (true, p) => format!("*:{p}"),
-        _ => a.to_string(),
+    if a.ip().is_unspecified() && a.port() == 0 {
+        "*".into()
+    } else {
+        a.to_string()
     }
 }
 
@@ -134,7 +136,8 @@ mod tests {
         assert_eq!(human(1536.0), "1.5 KiB");
         assert_eq!(human(300.0 * 1024.0 * 1024.0), "300 MiB");
         assert_eq!(human(1018.0 * 1024.0), "0.99 MiB");
-        assert_eq!(fmt_addr("0.0.0.0:22".parse().unwrap()), "*:22");
+        assert_eq!(fmt_addr("0.0.0.0:22".parse().unwrap()), "0.0.0.0:22");
+        assert_eq!(fmt_addr("[::]:22".parse().unwrap()), "[::]:22");
         assert_eq!(fmt_addr("[::]:0".parse().unwrap()), "*");
         assert_eq!(fmt_addr("[::1]:80".parse().unwrap()), "[::1]:80");
         assert_eq!(elide_middle("abcdef", 6), "abcdef");

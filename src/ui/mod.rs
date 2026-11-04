@@ -173,6 +173,16 @@ pub struct Reversed {
     pub flows: bool,
 }
 
+/// Which lists have a row the user chose. Until then (and again after Home)
+/// the selection stays on the top row as the list re-sorts, rather than
+/// following whatever happened to be first in the first sample.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Picked {
+    pub procs: bool,
+    pub socks: bool,
+    pub devs: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum DevSort {
     Ip,
@@ -266,6 +276,7 @@ pub(crate) struct App {
     pub sock_sel: Option<u64>,
     pub dev_state: TableState,
     pub dev_sel: Option<DevKey>,
+    pub picked: Picked,
     pub dev_sort: DevSort,
     /// The LAN scanner (None in tests) and its latest state.
     pub lan: Option<Lan>,
@@ -293,7 +304,6 @@ pub(crate) struct App {
     pub flow_state: TableState,
     pub flow_sel: Option<FlowKey>,
     pub flow_sort: FlowSort,
-    /// Programs (by name) whose packets are captured.
     /// Captured program names, each with the uid it is captured for.
     pub capturing: BTreeMap<String, u32>,
     /// Set when `capturing` changed and the sampler needs telling.
@@ -329,6 +339,7 @@ impl App {
             sock_sel: None,
             dev_state: TableState::default().with_selected(0),
             dev_sel: None,
+            picked: Picked::default(),
             dev_sort: DevSort::Ip,
             lan: None,
             lan_state: LanState::default(),
@@ -464,25 +475,42 @@ impl App {
         };
         self.select_pkt(pkts, row);
 
+        let picked = self.picked;
         let row = self
             .dev_sel
+            .filter(|_| picked.devs)
             .and_then(|ip| devs.iter().position(|d| *d == ip));
-        let row = row.unwrap_or_else(|| self.dev_state.selected().unwrap_or(0));
+        let row = row.unwrap_or_else(|| {
+            self.dev_state
+                .selected()
+                .filter(|_| picked.devs)
+                .unwrap_or(0)
+        });
         self.select_dev(devs, row);
 
         let row = match &self.proc_sel {
-            Some(key) => views.iter().position(|v| v.is(key)),
-            None => None,
+            Some(key) if picked.procs => views.iter().position(|v| v.is(key)),
+            _ => None,
         };
-        let row = row.unwrap_or_else(|| self.proc_state.selected().unwrap_or(0));
+        let row = row.unwrap_or_else(|| {
+            self.proc_state
+                .selected()
+                .filter(|_| picked.procs)
+                .unwrap_or(0)
+        });
         self.select_proc(views, row);
 
-        let row = self.sock_sel.and_then(|cookie| {
+        let row = self.sock_sel.filter(|_| picked.socks).and_then(|cookie| {
             socks
                 .iter()
                 .position(|&i| self.snap.sockets[i].sock.cookie == cookie)
         });
-        let row = row.unwrap_or_else(|| self.sock_state.selected().unwrap_or(0));
+        let row = row.unwrap_or_else(|| {
+            self.sock_state
+                .selected()
+                .filter(|_| picked.socks)
+                .unwrap_or(0)
+        });
         self.select_sock(socks, row);
     }
 
@@ -589,14 +617,17 @@ impl App {
         match self.tab {
             Tab::Procs => {
                 let row = to(self.proc_state.selected().unwrap_or(0), views.len());
+                self.picked.procs = row != 0;
                 self.select_proc(&views, row);
             }
             Tab::Sockets => {
                 let row = to(self.sock_state.selected().unwrap_or(0), socks.len());
+                self.picked.socks = row != 0;
                 self.select_sock(&socks, row);
             }
             Tab::Devices => {
                 let row = to(self.dev_state.selected().unwrap_or(0), devs.len());
+                self.picked.devs = row != 0;
                 self.select_dev(&devs, row);
             }
             Tab::Packets if self.pkt_flows => {

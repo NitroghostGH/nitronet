@@ -985,6 +985,7 @@ fn vanished_item_keeps_row() {
 fn grouping_keeps_the_selected_program() {
     let mut a = app();
     a.proc_sel = Some(super::ProcKey::Owner(Owner::Pid(1876864))); // the second "claude"
+    a.picked.procs = true;
     render(&mut a, 160, 45);
     assert_eq!(selected_name(&a), "claude");
     key(&mut a, KeyCode::Char('g'));
@@ -999,6 +1000,31 @@ fn grouping_keeps_the_selected_program() {
     key(&mut a, KeyCode::Char('g'));
     render(&mut a, 160, 45);
     assert_eq!(selected_name(&a), "claude");
+}
+
+#[test]
+fn selection_stays_on_top_until_a_row_is_picked() {
+    let mut a = app();
+    render(&mut a, 160, 45);
+    assert_eq!(a.proc_state.selected(), Some(0));
+    // Re-sorting moves another program to the top; the selection goes with the top.
+    let first = selected_name(&a);
+    key(&mut a, KeyCode::Char('s'));
+    render(&mut a, 160, 45);
+    assert_eq!(a.proc_state.selected(), Some(0));
+    assert_ne!(selected_name(&a), first, "the sort should change the top row");
+    // Once a row is picked, it is followed through a re-sort.
+    key(&mut a, KeyCode::Down);
+    render(&mut a, 160, 45);
+    let picked = selected_name(&a);
+    key(&mut a, KeyCode::Char('s'));
+    render(&mut a, 160, 45);
+    assert_eq!(selected_name(&a), picked);
+    // Home goes back to following the top.
+    key(&mut a, KeyCode::Home);
+    key(&mut a, KeyCode::Char('s'));
+    render(&mut a, 160, 45);
+    assert_eq!(a.proc_state.selected(), Some(0));
 }
 
 #[test]
