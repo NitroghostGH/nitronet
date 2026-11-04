@@ -98,7 +98,7 @@ pub fn ago(t: std::time::Instant) -> String {
     }
 }
 
-/// Round-trip time: "0.9 ms", "48 ms", "1.2 s".
+/// A short duration, such as a round-trip time: "0.9 ms", "48 ms", "1.2 s".
 pub fn fmt_rtt(d: std::time::Duration) -> String {
     let ms = d.as_secs_f64() * 1000.0;
     if ms < 10.0 {

@@ -181,6 +181,7 @@ pub struct Picked {
     pub procs: bool,
     pub socks: bool,
     pub devs: bool,
+    pub flows: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -458,11 +459,14 @@ impl App {
     ) {
         // Conversations are listed only while shown (see `shown_flows`).
         if let Some(flows) = flows {
+            let picked = self.picked.flows;
             let row = self
                 .flow_sel
                 .as_ref()
+                .filter(|_| picked)
                 .and_then(|k| flows.iter().position(|f| f.key == *k));
-            let row = row.unwrap_or_else(|| self.flow_state.selected().unwrap_or(0));
+            let row =
+                row.unwrap_or_else(|| self.flow_state.selected().filter(|_| picked).unwrap_or(0));
             self.select_flow(flows, row);
         }
 
@@ -632,6 +636,7 @@ impl App {
             }
             Tab::Packets if self.pkt_flows => {
                 let row = to(self.flow_state.selected().unwrap_or(0), flows.len());
+                self.picked.flows = row != 0;
                 self.select_flow(&flows, row);
             }
             Tab::Packets => {

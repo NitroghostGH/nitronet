@@ -897,15 +897,17 @@ fn looks_like_http(app: &str) -> bool {
 
 /// Text, random-looking (encrypted or compressed), or other binary.
 fn guess(b: &[u8]) -> Content {
-    if b.len() < 16 {
-        return Content::Binary;
-    }
     let text = b
         .iter()
         .filter(|&&c| (0x20..0x7f).contains(&c) || matches!(c, b'\r' | b'\n' | b'\t'))
         .count();
-    if text * 100 >= b.len() * 90 {
+    // A short payload has to be all text (like the "0\r\n\r\n" that ends a
+    // chunked HTTP body); a longer one may have a few other bytes.
+    if text == b.len() || (b.len() >= 16 && text * 100 >= b.len() * 90) {
         return Content::Plain("text");
+    }
+    if b.len() < 16 {
+        return Content::Binary;
     }
     // Shannon entropy in bits per byte. Random data of n bytes can reach at
     // most log2(n), so compare against that for short payloads.
@@ -1221,6 +1223,11 @@ pub(crate) mod tests {
         let (k, _) = run(ipv4(UDP, me, srv, 5006, 9999, 0, &[0u8; 100]), true);
         assert_eq!(k, Content::Binary);
         assert!(Content::Binary.unencrypted_data() && !Content::Empty.unencrypted_data());
+        // A short payload is text only if every byte is.
+        let (k, _) = run(ipv4(TCP, me, srv, 5008, 8080, 0x18, b"0\r\n\r\n"), true);
+        assert_eq!(k, Content::Plain("text"));
+        let (k, _) = run(ipv4(TCP, me, srv, 5009, 8080, 0x18, b"ab\x01cd"), true);
+        assert_eq!(k, Content::Binary);
 
         // Random-looking bytes are only a hint: the conversation isn't marked
         // encrypted, so readable text later on it is still plain.

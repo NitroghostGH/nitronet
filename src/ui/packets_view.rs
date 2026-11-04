@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph};
 
-use super::fmt::{elide_end, elide_middle, human};
+use super::fmt::{elide_end, elide_middle, fmt_rtt, human};
 use super::sockets_view::addr_line;
 use super::theme::{Theme, theme};
 use super::view::{draw_table, empty_message, filter_line, panel, table_window};
@@ -751,7 +751,7 @@ fn draw_flow_detail(app: &App, f: &mut Frame, area: Rect, fl: &Flow) {
         }
     }
     let span = match fl.last.duration_since(fl.first) {
-        Ok(d) if fl.packets() > 1 => format!(" · {:.1}s", d.as_secs_f64()),
+        Ok(d) if fl.packets() > 1 => format!(" · {}", fmt_rtt(d)),
         _ => String::new(),
     };
     let mut lines = vec![

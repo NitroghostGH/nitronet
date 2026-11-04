@@ -1012,7 +1012,11 @@ fn selection_stays_on_top_until_a_row_is_picked() {
     key(&mut a, KeyCode::Char('s'));
     render(&mut a, 160, 45);
     assert_eq!(a.proc_state.selected(), Some(0));
-    assert_ne!(selected_name(&a), first, "the sort should change the top row");
+    assert_ne!(
+        selected_name(&a),
+        first,
+        "the sort should change the top row"
+    );
     // Once a row is picked, it is followed through a re-sort.
     key(&mut a, KeyCode::Down);
     render(&mut a, 160, 45);
@@ -1573,6 +1577,7 @@ fn logins_in_clear_are_flagged_and_searchable() {
     assert_eq!(flows[0].secrets, 1);
     a.filter.clear();
     a.flow_sel = Some(flows[0].key.clone());
+    a.picked.flows = true;
     let text = buffer_text(&render(&mut a, 180, 46));
     for want in [
         "⚠ password field · POST /login HTTP/1.1",
@@ -1583,6 +1588,36 @@ fn logins_in_clear_are_flagged_and_searchable() {
     ] {
         assert!(text.contains(want), "missing {want:?}\n{text}");
     }
+}
+
+#[test]
+fn conversations_list_follows_the_newest_until_one_is_picked() {
+    let mut a = app();
+    key(&mut a, KeyCode::Char('4'));
+    key(&mut a, KeyCode::Char('f'));
+    render(&mut a, 160, 45);
+    key(&mut a, KeyCode::Down);
+    key(&mut a, KeyCode::Home);
+    // A new conversation arrives; sorted by most recent, it goes on top.
+    let mut newer = login_packets(1000);
+    for p in &mut newer {
+        p.at += Duration::from_secs(1 << 32);
+    }
+    a.add_packets(newer);
+    render(&mut a, 160, 45);
+    assert_eq!(a.flow_state.selected(), Some(0));
+    assert_eq!(a.flow_sel.as_ref().and_then(|k| k.local.1), Some(50100));
+    // A picked conversation stays selected as newer packets reorder the list.
+    key(&mut a, KeyCode::Down);
+    render(&mut a, 160, 45);
+    let picked = a.flow_sel.clone();
+    let mut newest = login_packets(2000);
+    for p in &mut newest {
+        p.at += Duration::from_secs(1 << 33);
+    }
+    a.add_packets(newest);
+    render(&mut a, 160, 45);
+    assert_eq!(a.flow_sel, picked);
 }
 
 #[test]
