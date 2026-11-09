@@ -12,7 +12,7 @@ use super::fmt::{amount, elide_end, human};
 use super::sockets_view::{addr_line, state_style};
 use super::theme::{Theme, theme};
 use super::view::{
-    draw_mirrored_graph, draw_table, empty_message, filter_line, panel, table_window,
+    draw_mirrored_graph, draw_table, empty_message, filter_line, panel, sort_columns, table_window,
 };
 use super::widgets::{Col, col, traffic_bar};
 use super::{App, ProcSort, ProcView};
@@ -31,6 +31,21 @@ const PROC_COLS: [Col; 11] = [
     col("↑ TOTAL", 10, 2).right(),
     col("CONN", 4, 3).right(),
     col("PORTS", 22, 7),
+];
+
+/// What a click on each of `PROC_COLS` sorts by.
+pub(super) const PROC_SORT_BY: [Option<ProcSort>; 11] = [
+    Some(ProcSort::Pid),
+    Some(ProcSort::Name),
+    Some(ProcSort::Service),
+    Some(ProcSort::User),
+    Some(ProcSort::RateIn),
+    Some(ProcSort::RateOut),
+    Some(ProcSort::Rate),
+    Some(ProcSort::TotalIn),
+    Some(ProcSort::TotalOut),
+    Some(ProcSort::Conn),
+    Some(ProcSort::Ports),
 ];
 
 pub(super) fn draw_procs(
@@ -57,22 +72,12 @@ pub(super) fn draw_procs(
             proc_cells(t, v, max_rate, captured)
         })
         .collect();
-    let (sorted_col, desc) = match app.proc_sort {
-        ProcSort::Rate => (4, true),
-        ProcSort::Total => (7, true),
-        ProcSort::Name => (1, false),
-        ProcSort::Pid => (0, false),
+    let sorted = match app.proc_sort {
+        ProcSort::Total => vec![7, 8],
+        s => sort_columns(&PROC_SORT_BY, s),
     };
     let mut info = vec![Span::styled(" sort ", t.faint())];
-    info.push(Span::styled(
-        match app.proc_sort {
-            ProcSort::Rate => "rate",
-            ProcSort::Total => "total",
-            ProcSort::Name => "name",
-            ProcSort::Pid => "pid",
-        },
-        t.muted(),
-    ));
+    info.push(Span::styled(app.proc_sort.label(), t.muted()));
     if app.group_by_program {
         info.push(Span::styled(" · ", t.faint()));
         info.push(Span::styled("grouped by program", t.fg(t.accent)));
@@ -89,7 +94,7 @@ pub(super) fn draw_procs(
         area,
         block,
         &PROC_COLS,
-        (sorted_col, desc != app.reverse.procs),
+        (&sorted, app.proc_sort.desc() != app.reverse.procs),
         rows,
         &empty,
     );

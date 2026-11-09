@@ -4,7 +4,7 @@
 //! help; each tab's table and detail pane are in its own `*_view.rs`.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
@@ -411,8 +411,14 @@ pub(super) fn table_window(app: &App, len: usize, area: Rect) -> std::ops::Range
     lo..hi
 }
 
+/// The columns a sort's arrow goes on: those a click sorts by `sort`.
+pub(super) fn sort_columns<S: PartialEq + Copy>(by: &[Option<S>], sort: S) -> Vec<usize> {
+    (0..by.len()).filter(|&i| by[i] == Some(sort)).collect()
+}
+
 /// Draws a table. `rows` has one entry per row; rows outside `table_window`
-/// may be empty.
+/// may be empty. `sorted` has the columns showing the sort arrow and whether
+/// it points down.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw_table(
     app: &mut App,
@@ -420,7 +426,7 @@ pub(super) fn draw_table(
     area: Rect,
     block: Block<'static>,
     cols: &[Col],
-    sorted: (usize, bool),
+    sorted: (&[usize], bool),
     rows: Vec<Vec<Cell<'static>>>,
     empty: &str,
 ) {
@@ -435,7 +441,7 @@ pub(super) fn draw_table(
     let header = Row::new(shown.iter().map(|&i| {
         let c = &cols[i];
         let mut spans = vec![Span::styled(c.title, t.header())];
-        if i == sorted.0 {
+        if sorted.0.contains(&i) {
             spans.push(Span::styled(
                 sort_arrow(sorted.1),
                 t.fg(t.accent).add_modifier(Modifier::BOLD),
@@ -457,6 +463,20 @@ pub(super) fn draw_table(
         )
     });
     let widths: Vec<Constraint> = shown.iter().map(|&i| cols[i].constraint()).collect();
+
+    // Where the header cells land, for mouse clicks. This is the layout Table
+    // itself uses: the highlight marker's column, then the columns from the left.
+    let [_, columns] = Layout::horizontal([Constraint::Length(MARKER), Constraint::Fill(0)])
+        .areas(Rect { height: 1, ..inner });
+    let cells = Layout::horizontal(widths.iter().copied())
+        .flex(Flex::Start)
+        .spacing(SPACING)
+        .split(columns);
+    app.hit.header = shown
+        .iter()
+        .zip(cells.iter())
+        .map(|(&i, r)| (*r, i))
+        .collect();
 
     let state = match app.tab {
         Tab::Procs => &mut app.proc_state,
@@ -624,14 +644,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
                 ("PgUp PgDn", "move by a page"),
                 ("Home End", "first / last row"),
                 ("tab ← →  1-4", "switch view"),
-                ("mouse", "click rows and tabs, wheel scrolls"),
+                ("mouse", "click rows, tabs and headers; wheel scrolls"),
             ],
         ),
         (
             "view",
             &[
                 ("/", "filter: all words match, !word excludes"),
-                ("s  r", "cycle sort · reverse it"),
+                ("s  r", "cycle sort · reverse it (or click a header)"),
                 ("g", "group processes by program"),
                 ("l", "only listening sockets"),
                 ("enter  d", "toggle the detail pane"),

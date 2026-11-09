@@ -13,7 +13,7 @@ use ratatui::widgets::{Cell, Paragraph};
 use super::fmt::{elide_end, elide_middle, fmt_rtt, human};
 use super::sockets_view::addr_line;
 use super::theme::{Theme, theme};
-use super::view::{draw_table, empty_message, filter_line, panel, table_window};
+use super::view::{draw_table, empty_message, filter_line, panel, sort_columns, table_window};
 use super::widgets::{Col, col};
 use super::{App, ContentFilter, DirFilter, Flow, FlowSort};
 use crate::packet::{self, Content, Endpoint, L4, Packet};
@@ -205,7 +205,7 @@ fn draw_packets(app: &mut App, f: &mut Frame, area: Rect, idx: &[usize], tabs: L
         area,
         block,
         &PKT_COLS,
-        (0, app.reverse.pkts),
+        (&[0], app.reverse.pkts),
         rows,
         &empty,
     );
@@ -633,6 +633,19 @@ const FLOW_COLS: [Col; 9] = [
     col("WHAT", 24, 0).flex(),
 ];
 
+/// What a click on each of `FLOW_COLS` sorts by.
+pub(super) const FLOW_SORT_BY: [Option<FlowSort>; 9] = [
+    Some(FlowSort::Recent),
+    Some(FlowSort::Program),
+    Some(FlowSort::Proto),
+    Some(FlowSort::Remote),
+    Some(FlowSort::Local),
+    Some(FlowSort::Packets),
+    Some(FlowSort::BytesIn),
+    Some(FlowSort::BytesOut),
+    None,
+];
+
 fn draw_flows(app: &mut App, f: &mut Frame, area: Rect, flows: &[Flow], tabs: Line<'static>) {
     let t = theme();
     let win = table_window(app, flows.len(), area);
@@ -647,11 +660,9 @@ fn draw_flows(app: &mut App, f: &mut Frame, area: Rect, flows: &[Flow], tabs: Li
             }
         })
         .collect();
-    let (sorted, desc) = match app.flow_sort {
-        FlowSort::Recent => (0, true),
-        FlowSort::Program => (1, false),
-        FlowSort::Packets => (5, true),
-        FlowSort::Bytes => (6, true),
+    let sorted = match app.flow_sort {
+        FlowSort::Bytes => vec![6, 7],
+        s => sort_columns(&FLOW_SORT_BY, s),
     };
     let block = panel()
         .title(tabs)
@@ -672,7 +683,7 @@ fn draw_flows(app: &mut App, f: &mut Frame, area: Rect, flows: &[Flow], tabs: Li
         area,
         block,
         &FLOW_COLS,
-        (sorted, desc != app.reverse.flows),
+        (&sorted, app.flow_sort.desc() != app.reverse.flows),
         rows,
         &empty,
     );

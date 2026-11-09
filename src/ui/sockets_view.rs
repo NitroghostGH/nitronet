@@ -11,7 +11,9 @@ use ratatui::widgets::Cell;
 use super::fmt::{amount, elide_end, elide_middle, fmt_addr};
 use super::procs_view::proto_color;
 use super::theme::{Theme, theme};
-use super::view::{MARKER, SPACING, draw_table, empty_message, filter_line, panel, table_window};
+use super::view::{
+    MARKER, SPACING, draw_table, empty_message, filter_line, panel, sort_columns, table_window,
+};
 use super::widgets::{Col, col, fit_columns, traffic_bar};
 use super::{App, SockSort};
 use crate::sampler::{Owner, SockRow};
@@ -28,6 +30,21 @@ const SOCK_COLS: [Col; 11] = [
     col("TRAFFIC", 12, 6),
     col("↓ BYTES", 10, 3).right(),
     col("↑ BYTES", 10, 3).right(),
+];
+
+/// What a click on each of `SOCK_COLS` sorts by.
+pub(super) const SOCK_SORT_BY: [Option<SockSort>; 11] = [
+    Some(SockSort::Proto),
+    Some(SockSort::Port),
+    Some(SockSort::Remote),
+    Some(SockSort::State),
+    Some(SockSort::Program),
+    Some(SockSort::Pid),
+    Some(SockSort::RateIn),
+    Some(SockSort::RateOut),
+    Some(SockSort::Rate),
+    Some(SockSort::BytesIn),
+    Some(SockSort::BytesOut),
 ];
 
 pub(super) fn draw_sockets(
@@ -71,22 +88,9 @@ pub(super) fn draw_sockets(
             sock_cells(t, s, name, addr_w, max_rate)
         })
         .collect();
-    let (sorted_col, desc) = match app.sock_sort {
-        SockSort::Rate => (6, true),
-        SockSort::Port => (1, false),
-        SockSort::State => (3, false),
-        SockSort::Program => (4, false),
-    };
+    let sorted = sort_columns(&SOCK_SORT_BY, app.sock_sort);
     let mut info = vec![Span::styled(" sort ", t.faint())];
-    info.push(Span::styled(
-        match app.sock_sort {
-            SockSort::Rate => "rate",
-            SockSort::Port => "port",
-            SockSort::State => "state",
-            SockSort::Program => "program",
-        },
-        t.muted(),
-    ));
+    info.push(Span::styled(app.sock_sort.label(), t.muted()));
     if app.listening_only {
         info.push(Span::styled(" · ", t.faint()));
         info.push(Span::styled("listening only", t.fg(t.good)));
@@ -103,7 +107,7 @@ pub(super) fn draw_sockets(
         area,
         block,
         &SOCK_COLS,
-        (sorted_col, desc != app.reverse.socks),
+        (&sorted, app.sock_sort.desc() != app.reverse.socks),
         rows,
         &empty,
     );

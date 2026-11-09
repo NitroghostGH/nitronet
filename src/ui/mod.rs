@@ -13,6 +13,7 @@ mod packets_view;
 mod procs_view;
 mod query;
 mod sockets_view;
+mod sort;
 mod theme;
 mod view;
 mod widgets;
@@ -38,7 +39,8 @@ use crate::lan::{DevKey, Lan, LanState};
 use crate::packet::{FlowKey, Packet};
 use crate::sampler::{Owner, ProcRow, Sampler, Snapshot};
 use history::History;
-pub(crate) use packets::{ContentFilter, DirFilter, Flow, FlowSort};
+pub(crate) use packets::{ContentFilter, DirFilter, Flow};
+pub(crate) use sort::{DevSort, FlowSort, ProcSort, SockSort};
 
 /// How long a status message stays in the footer.
 const FLASH: Duration = Duration::from_secs(4);
@@ -184,30 +186,6 @@ pub struct Picked {
     pub flows: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum DevSort {
-    Ip,
-    Name,
-    Vendor,
-    Seen,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum ProcSort {
-    Rate,
-    Total,
-    Name,
-    Pid,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum SockSort {
-    Rate,
-    Port,
-    State,
-    Program,
-}
-
 /// A process row as shown. When grouped by program it may stand for several pids.
 pub(crate) struct ProcView {
     pub row: ProcRow,
@@ -249,6 +227,8 @@ impl ProcView {
 #[derive(Default)]
 pub(crate) struct HitMap {
     pub tabs: Vec<(Rect, Tab)>,
+    /// The table's header cells, with the index of each one's column.
+    pub header: Vec<(Rect, usize)>,
     /// The table's row area (below the header row).
     pub rows: Rect,
 }

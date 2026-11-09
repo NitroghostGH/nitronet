@@ -5,7 +5,12 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Position;
 
-use super::{App, DevSort, ProcSort, SockSort, Tab};
+use super::devices_view::DEV_SORT_BY;
+use super::packets_view::FLOW_SORT_BY;
+use super::procs_view::PROC_SORT_BY;
+use super::sockets_view::SOCK_SORT_BY;
+use super::sort::pick;
+use super::{App, Tab};
 use crate::sampler::Owner;
 
 impl App {
@@ -220,40 +225,32 @@ impl App {
 
     fn cycle_sort(&mut self) {
         match self.tab {
-            Tab::Packets if self.pkt_flows => {
-                self.reverse.flows = false;
-                self.flow_sort = self.flow_sort.next();
-                return;
-            }
+            Tab::Procs => self.proc_sort = self.proc_sort.next(),
+            Tab::Sockets => self.sock_sort = self.sock_sort.next(),
+            Tab::Devices => self.dev_sort = self.dev_sort.next(),
+            Tab::Packets if self.pkt_flows => self.flow_sort = self.flow_sort.next(),
             // Packets are always in time order (r reverses).
             Tab::Packets => return,
-            _ => *self.reversed_mut() = false,
         }
+        *self.reversed_mut() = false;
+    }
+
+    /// A click on column `col`'s header: sort by it, or flip the order if the
+    /// list is already sorted by it.
+    pub(super) fn sort_by_column(&mut self, col: usize) {
+        fn at<S: Copy>(by: &[Option<S>], col: usize) -> Option<S> {
+            by.get(col).copied().flatten()
+        }
+        let r = &mut self.reverse;
         match self.tab {
-            Tab::Procs => {
-                self.proc_sort = match self.proc_sort {
-                    ProcSort::Rate => ProcSort::Total,
-                    ProcSort::Total => ProcSort::Name,
-                    ProcSort::Name => ProcSort::Pid,
-                    ProcSort::Pid => ProcSort::Rate,
-                }
+            Tab::Procs => pick(&mut self.proc_sort, &mut r.procs, at(&PROC_SORT_BY, col)),
+            Tab::Sockets => pick(&mut self.sock_sort, &mut r.socks, at(&SOCK_SORT_BY, col)),
+            Tab::Devices => pick(&mut self.dev_sort, &mut r.devs, at(&DEV_SORT_BY, col)),
+            Tab::Packets if self.pkt_flows => {
+                pick(&mut self.flow_sort, &mut r.flows, at(&FLOW_SORT_BY, col))
             }
-            Tab::Sockets => {
-                self.sock_sort = match self.sock_sort {
-                    SockSort::Rate => SockSort::Port,
-                    SockSort::Port => SockSort::State,
-                    SockSort::State => SockSort::Program,
-                    SockSort::Program => SockSort::Rate,
-                }
-            }
-            Tab::Devices => {
-                self.dev_sort = match self.dev_sort {
-                    DevSort::Ip => DevSort::Name,
-                    DevSort::Name => DevSort::Vendor,
-                    DevSort::Vendor => DevSort::Seen,
-                    DevSort::Seen => DevSort::Ip,
-                }
-            }
+            // Packets are in time order; a click on TIME flips it.
+            Tab::Packets if col == 0 => self.reverse.pkts = !self.reverse.pkts,
             Tab::Packets => {}
         }
     }
@@ -283,6 +280,10 @@ impl App {
                 }
                 if let Some(&(_, tab)) = self.hit.tabs.iter().find(|(r, _)| r.contains(pos)) {
                     self.set_tab(tab);
+                } else if let Some(&(_, col)) =
+                    self.hit.header.iter().find(|(r, _)| r.contains(pos))
+                {
+                    self.sort_by_column(col);
                 } else if self.hit.rows.contains(pos) {
                     let row = self.state().offset() + (m.row - self.hit.rows.y) as usize;
                     self.move_to(|_, _| row);

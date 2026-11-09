@@ -117,7 +117,7 @@ impl Content {
 }
 
 /// An address with a port, when the protocol has ports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Endpoint(pub IpAddr, pub Option<u16>);
 
 impl std::fmt::Display for Endpoint {

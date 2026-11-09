@@ -1002,6 +1002,86 @@ fn grouping_keeps_the_selected_program() {
     assert_eq!(selected_name(&a), "claude");
 }
 
+/// Clicks the header of the column titled `title` and redraws. The click lands
+/// on the title as drawn, so this also checks that the click targets line up
+/// with the columns on screen.
+fn click_header(a: &mut App, title: &str, w: u16, h: u16) -> String {
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let b = render(a, w, h);
+    let rows: Vec<String> = buffer_text(&b).lines().map(String::from).collect();
+    let (y, x) = rows
+        .iter()
+        .enumerate()
+        .find_map(|(y, r)| {
+            let at = r.find(&format!("  {title}"))? + 2;
+            Some((y, r[..at].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("no header {title:?}"));
+    let (x, y) = (x as u16 + 1, y as u16);
+    assert!(
+        a.hit.header.iter().any(|(r, _)| r.contains((x, y).into())),
+        "{title:?} at {x},{y} is outside every header cell"
+    );
+    a.on_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+    });
+    buffer_text(&render(a, w, h))
+}
+
+#[test]
+fn clicking_a_header_sorts_by_it() {
+    use super::{FlowSort, ProcSort, SockSort};
+    let mut a = app();
+    let text = click_header(&mut a, "↑ RATE", 160, 45);
+    assert_eq!(a.proc_sort, ProcSort::RateOut);
+    assert!(text.contains("↑ RATE ▾") && text.contains("sort ↑ rate"), "{text}");
+    let up = |a: &App| -> Vec<f64> { a.proc_views().iter().map(|v| v.row.rate_out).collect() };
+    assert!(up(&a).is_sorted_by(|x, y| x >= y), "{:?}", up(&a));
+    // Again flips it.
+    let text = click_header(&mut a, "↑ RATE", 160, 45);
+    assert!(a.reverse.procs && text.contains("↑ RATE ▴"));
+    assert!(up(&a).is_sorted());
+    // Another column starts in its own natural order: names A to Z.
+    click_header(&mut a, "PROGRAM", 160, 45);
+    assert_eq!((a.proc_sort, a.reverse.procs), (ProcSort::Name, false));
+    click_header(&mut a, "CONN", 160, 45);
+    let conns: Vec<usize> = a.proc_views().iter().map(|v| v.row.sockets).collect();
+    assert!(conns.is_sorted_by(|x, y| x >= y), "{conns:?}");
+    // s goes back into its usual cycle.
+    key(&mut a, KeyCode::Char('s'));
+    assert_eq!(a.proc_sort, ProcSort::Rate);
+
+    key(&mut a, KeyCode::Char('2'));
+    click_header(&mut a, "↓ BYTES", 160, 45);
+    assert_eq!(a.sock_sort, SockSort::BytesIn);
+    let down: Vec<u64> = a
+        .sock_rows()
+        .iter()
+        .map(|&i| a.snap.sockets[i].bytes.map_or(0, |b| b.0))
+        .collect();
+    assert!(down.is_sorted_by(|x, y| x >= y), "{down:?}");
+    // The Processes list kept its own sort.
+    assert_eq!(a.proc_sort, ProcSort::Rate);
+
+    key(&mut a, KeyCode::Char('3'));
+    click_header(&mut a, "VENDOR", 180, 46);
+    assert_eq!(a.dev_sort, super::DevSort::Vendor);
+
+    // Packets stay in time order; TIME flips it.
+    a.add_packets(login_packets(1000));
+    key(&mut a, KeyCode::Char('4'));
+    click_header(&mut a, "TIME", 160, 45);
+    assert!(a.reverse.pkts);
+    click_header(&mut a, "PROTO", 160, 45);
+    assert!(a.reverse.pkts);
+    key(&mut a, KeyCode::Char('f'));
+    click_header(&mut a, "PKTS", 160, 45);
+    assert_eq!(a.flow_sort, FlowSort::Packets);
+}
+
 #[test]
 fn selection_stays_on_top_until_a_row_is_picked() {
     let mut a = app();

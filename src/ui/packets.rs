@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use super::App;
 use super::query::{Found, Query};
+use super::{App, FlowSort};
 use crate::packet::{Content, FlowKey, Packet};
 use crate::sampler::Owner;
 
@@ -69,33 +69,6 @@ impl ContentFilter {
             ContentFilter::Data => p.content != Content::Empty,
             ContentFilter::Unencrypted => p.content.unencrypted_data(),
             ContentFilter::Secrets => p.secret.is_some(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum FlowSort {
-    Recent,
-    Bytes,
-    Packets,
-    Program,
-}
-
-impl FlowSort {
-    pub fn next(self) -> Self {
-        match self {
-            FlowSort::Recent => FlowSort::Bytes,
-            FlowSort::Bytes => FlowSort::Packets,
-            FlowSort::Packets => FlowSort::Program,
-            FlowSort::Program => FlowSort::Recent,
-        }
-    }
-    pub fn label(self) -> &'static str {
-        match self {
-            FlowSort::Recent => "recent",
-            FlowSort::Bytes => "bytes",
-            FlowSort::Packets => "packets",
-            FlowSort::Program => "program",
         }
     }
 }
@@ -279,18 +252,20 @@ impl App {
             );
             q.passes(&found)
         });
+        use std::cmp::Reverse;
         let bytes = |f: &Flow| f.bytes_in + f.bytes_out;
+        // Ties go to the most recent.
+        flows.sort_by_key(|f| Reverse(f.last));
         match self.flow_sort {
-            FlowSort::Recent => flows.sort_by_key(|f| std::cmp::Reverse(f.last)),
-            FlowSort::Bytes => flows.sort_by_key(|f| std::cmp::Reverse(bytes(f))),
-            FlowSort::Packets => flows.sort_by_key(|f| std::cmp::Reverse(f.packets())),
-            FlowSort::Program => flows.sort_by(|a, b| {
-                a.key
-                    .program
-                    .to_lowercase()
-                    .cmp(&b.key.program.to_lowercase())
-                    .then(b.last.cmp(&a.last))
-            }),
+            FlowSort::Recent => {}
+            FlowSort::Bytes => flows.sort_by_key(|f| Reverse(bytes(f))),
+            FlowSort::BytesIn => flows.sort_by_key(|f| Reverse(f.bytes_in)),
+            FlowSort::BytesOut => flows.sort_by_key(|f| Reverse(f.bytes_out)),
+            FlowSort::Packets => flows.sort_by_key(|f| Reverse(f.packets())),
+            FlowSort::Program => flows.sort_by_cached_key(|f| f.key.program.to_lowercase()),
+            FlowSort::Proto => flows.sort_by_key(|f| f.key.proto),
+            FlowSort::Remote => flows.sort_by_key(|f| f.key.remote),
+            FlowSort::Local => flows.sort_by_key(|f| f.key.local),
         }
         if self.reverse.flows {
             flows.reverse();

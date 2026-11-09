@@ -9,7 +9,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use super::fmt::{ago, amount, elide_end, elide_middle, fmt_rtt, short_v6};
 use super::procs_view::proto_color;
 use super::theme::{Theme, theme};
-use super::view::{draw_table, empty_message, filter_line, panel, table_window};
+use super::view::{draw_table, empty_message, filter_line, panel, sort_columns, table_window};
 use super::widgets::{Col, col};
 use super::{App, DevSort};
 use crate::lan::discover::fmt_mac;
@@ -28,6 +28,19 @@ const DEV_COLS: [Col; 9] = [
     col("RTT", 8, 3).right(),
     col("SEEN", 6, 1).right(),
     col("", 24, 6),
+];
+
+/// What a click on each of `DEV_COLS` sorts by. The online dot sorts like SEEN.
+pub(super) const DEV_SORT_BY: [Option<DevSort>; 9] = [
+    Some(DevSort::Seen),
+    Some(DevSort::Ip),
+    Some(DevSort::Name),
+    Some(DevSort::Ipv6),
+    Some(DevSort::Vendor),
+    Some(DevSort::Mac),
+    Some(DevSort::Rtt),
+    Some(DevSort::Seen),
+    None,
 ];
 
 /// The scanner's status for the panel border: interface, range, method and
@@ -116,16 +129,23 @@ pub(super) fn draw_devices(
             dev_cells(t, &app.lan_state.devices[k], ours)
         })
         .collect();
-    let (sorted_col, desc) = match app.dev_sort {
-        DevSort::Ip => (1, false),
-        DevSort::Name => (2, false),
-        DevSort::Vendor => (4, false),
-        DevSort::Seen => (7, false),
-    };
+    // The arrow goes on SEEN, not the untitled dot column.
+    let sorted: Vec<usize> = sort_columns(&DEV_SORT_BY, app.dev_sort)
+        .into_iter()
+        .filter(|&i| i != 0)
+        .collect();
     let block = panel()
         .title(tabs)
         .title_top(scan_info(app, area.width >= 150))
-        .title_bottom(filter_line(app));
+        .title_bottom(filter_line(app))
+        .title_bottom(
+            Line::from(vec![
+                Span::styled(" sort ", t.faint()),
+                Span::styled(app.dev_sort.label(), t.muted()),
+                Span::raw(" "),
+            ])
+            .right_aligned(),
+        );
     let s = &app.lan_state;
     let empty = if app.lan.is_none() && s.scans == 0 && s.devices.is_empty() {
         "the scanner isn't running".to_string()
@@ -145,7 +165,7 @@ pub(super) fn draw_devices(
         area,
         block,
         &DEV_COLS,
-        (sorted_col, desc != app.reverse.devs),
+        (&sorted, app.dev_sort.desc() != app.reverse.devs),
         rows,
         &empty,
     );

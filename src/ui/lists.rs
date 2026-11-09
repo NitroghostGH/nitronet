@@ -1,10 +1,11 @@
 //! The rows each tab shows: filtered, sorted, and grouped.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::{App, DevSort, ProcSort, ProcView, SockSort, fmt_addr, query};
 use crate::lan::DevKey;
-use crate::sampler::{Owner, SockRow};
+use crate::sampler::{Owner, ProcRow, SockRow};
 
 impl App {
     /// Indices into `app.snap.sockets` of the rows to show, filtered and sorted.
@@ -36,17 +37,29 @@ impl App {
                 ])
             })
             .collect();
-        let rate = |i: &usize| all[*i].rate_in.unwrap_or(0.0) + all[*i].rate_out.unwrap_or(0.0);
         let port_key = |i: &usize| (all[*i].sock.local.port(), all[*i].sock.proto);
+        // Ties are in port order: sort by that first, then stably by the key.
+        idx.sort_by_key(port_key);
+        let rate_in = |s: &SockRow| s.rate_in.unwrap_or(0.0);
+        let rate_out = |s: &SockRow| s.rate_out.unwrap_or(0.0);
+        let mut by_rate =
+            |f: &dyn Fn(&SockRow) -> f64| idx.sort_by(|a, b| f(&all[*b]).total_cmp(&f(&all[*a])));
         match app.sock_sort {
-            SockSort::Rate => idx.sort_by(|a, b| {
-                rate(b)
-                    .total_cmp(&rate(a))
-                    .then(port_key(a).cmp(&port_key(b)))
+            SockSort::Rate => by_rate(&|s| rate_in(s) + rate_out(s)),
+            SockSort::RateIn => by_rate(&rate_in),
+            SockSort::RateOut => by_rate(&rate_out),
+            SockSort::BytesIn => idx.sort_by_key(|i| Reverse(all[*i].bytes.map_or(0, |b| b.0))),
+            SockSort::BytesOut => idx.sort_by_key(|i| Reverse(all[*i].bytes.map_or(0, |b| b.1))),
+            SockSort::Port => {}
+            SockSort::Proto => idx.sort_by_key(|i| all[*i].sock.proto),
+            // Connected sockets first; "*" (no remote) last.
+            SockSort::Remote => idx.sort_by_key(|i| {
+                let r = all[*i].sock.remote;
+                (r.ip().is_unspecified() && r.port() == 0, r)
             }),
-            SockSort::Port => idx.sort_by_key(port_key),
-            SockSort::State => idx.sort_by_key(|i| (all[*i].sock.state_str(), port_key(i))),
-            SockSort::Program => idx.sort_by_key(|i| (name(&all[*i]).to_lowercase(), port_key(i))),
+            SockSort::State => idx.sort_by_key(|i| all[*i].sock.state_str()),
+            SockSort::Program => idx.sort_by_cached_key(|i| name(&all[*i]).to_lowercase()),
+            SockSort::Pid => idx.sort_by_key(|i| all[*i].owner),
         }
         if app.reverse.socks {
             idx.reverse();
@@ -108,9 +121,12 @@ impl App {
                     d(k).vendor.as_ref().map(|v| v.to_lowercase()),
                 )
             }),
-            DevSort::Seen => {
-                keys.sort_by_key(|k| (!d(k).online, std::cmp::Reverse(d(k).last_seen)))
+            DevSort::Ipv6 => {
+                keys.sort_by_key(|k| (d(k).ipv6.is_empty(), d(k).ipv6.first().copied()))
             }
+            DevSort::Mac => keys.sort_by_key(|k| (d(k).mac.is_none(), d(k).mac)),
+            DevSort::Rtt => keys.sort_by_key(|k| (d(k).rtt.is_none(), d(k).rtt)),
+            DevSort::Seen => keys.sort_by_key(|k| (!d(k).online, Reverse(d(k).last_seen))),
         }
         if self.reverse.devs {
             keys.reverse();
@@ -203,26 +219,39 @@ impl App {
             self.matches(&fields)
         });
 
-        let rate = |v: &ProcView| v.row.rate_in + v.row.rate_out;
-        let total = |v: &ProcView| v.row.total_in + v.row.total_out;
+        let rate = |r: &ProcRow| r.rate_in + r.rate_out;
+        let total = |r: &ProcRow| r.total_in + r.total_out;
+        // Ties: busiest first, then by name and pid. Each sort below is stable.
+        views.sort_by(|a, b| {
+            let (a, b) = (&a.row, &b.row);
+            rate(b)
+                .total_cmp(&rate(a))
+                .then(total(b).cmp(&total(a)))
+                .then(a.name.cmp(&b.name))
+                .then(a.owner.cmp(&b.owner))
+        });
+        let mut by_rate =
+            |f: &dyn Fn(&ProcRow) -> f64| views.sort_by(|a, b| f(&b.row).total_cmp(&f(&a.row)));
         match self.proc_sort {
-            ProcSort::Rate => views.sort_by(|a, b| {
-                rate(b)
-                    .total_cmp(&rate(a))
-                    .then(total(b).cmp(&total(a)))
-                    .then(a.row.name.cmp(&b.row.name))
-            }),
-            ProcSort::Total => {
-                views.sort_by(|a, b| total(b).cmp(&total(a)).then(a.row.name.cmp(&b.row.name)))
-            }
-            ProcSort::Name => views.sort_by(|a, b| {
-                a.row
-                    .name
-                    .to_lowercase()
-                    .cmp(&b.row.name.to_lowercase())
-                    .then(a.row.owner.cmp(&b.row.owner))
-            }),
+            ProcSort::Rate => {}
+            ProcSort::RateIn => by_rate(&|r| r.rate_in),
+            ProcSort::RateOut => by_rate(&|r| r.rate_out),
+            ProcSort::Total => views.sort_by_key(|v| Reverse(total(&v.row))),
+            ProcSort::TotalIn => views.sort_by_key(|v| Reverse(v.row.total_in)),
+            ProcSort::TotalOut => views.sort_by_key(|v| Reverse(v.row.total_out)),
+            ProcSort::Conn => views.sort_by_key(|v| Reverse(v.row.sockets)),
+            ProcSort::Name => views.sort_by_cached_key(|v| v.row.name.to_lowercase()),
             ProcSort::Pid => views.sort_by_key(|v| v.row.owner),
+            // Rows without a value go last.
+            ProcSort::Service => views.sort_by_cached_key(|v| {
+                let unit = v.row.unit.as_ref().map(|u| u.to_lowercase());
+                (unit.is_none(), unit)
+            }),
+            ProcSort::User => views.sort_by_cached_key(|v| v.row.user.to_lowercase()),
+            ProcSort::Ports => views.sort_by_key(|v| {
+                let lowest = v.row.listening.iter().map(|&(_, p)| p).min();
+                (lowest.is_none(), lowest)
+            }),
         }
         if self.reverse.procs {
             views.reverse();
