@@ -1037,7 +1037,10 @@ fn clicking_a_header_sorts_by_it() {
     let mut a = app();
     let text = click_header(&mut a, "↑ RATE", 160, 45);
     assert_eq!(a.proc_sort, ProcSort::RateOut);
-    assert!(text.contains("↑ RATE ▾") && text.contains("sort ↑ rate"), "{text}");
+    assert!(
+        text.contains("↑ RATE ▾") && text.contains("sort ↑ rate"),
+        "{text}"
+    );
     let up = |a: &App| -> Vec<f64> { a.proc_views().iter().map(|v| v.row.rate_out).collect() };
     assert!(up(&a).is_sorted_by(|x, y| x >= y), "{:?}", up(&a));
     // Again flips it.
